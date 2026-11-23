@@ -40,6 +40,7 @@ dependencies:
   html: ^0.15.7
   path_provider: ^2.1.6
   file_picker: ^13.4.0
+  shared_preferences: ^2.5.3
 
 dev_dependencies:
   flutter_test:
@@ -63,10 +64,10 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  # To add assets to your application, add an assets section, like this:
-  # assets:
-  #   - images/a_dot_burr.jpeg
-  #   - images/a_dot_ham.jpeg
+  assets:
+    - assets/logo/cineflow_logo.png
+    - assets/logo/cineflow_logo_4color.png
+    - assets/cursors/hand_black.png
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

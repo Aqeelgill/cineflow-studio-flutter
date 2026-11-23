@@ -1,6 +1,12 @@
 #include "my_application.h"
 
 #include <flutter_linux/flutter_linux.h>
+#ifdef GDK_WINDOWING_X11
+#include <gdk/gdkx.h>
+#endif
+
+#include <limits.h>
+#include <unistd.h>
 
 #include "flutter/generated_plugin_registrant.h"
 
@@ -33,7 +39,43 @@ static void my_application_activate(GApplication* application) {
   // gtk_header_bar_set_show_close_button(header_bar, TRUE);
   // gtk_window_set_titlebar(window, GTK_WIDGET(header_bar));
 
-  gtk_window_set_title(window, "cineflow_flutter");
+  gtk_window_set_title(window, "CineFlow Studio");
+
+  // Set window/taskbar icon from bundled assets or known locations.
+  {
+    GError* icon_error = nullptr;
+    gboolean icon_set = FALSE;
+    gchar exe_path[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len != -1) {
+      exe_path[len] = '\0';
+      gchar* exe_dir = g_path_get_dirname(exe_path);
+      gchar* bundled = g_build_filename(
+          exe_dir, "data", "flutter_assets", "assets", "logo",
+          "cineflow_logo_4color.png", nullptr);
+      icon_set = gtk_window_set_icon_from_file(window, bundled, &icon_error);
+      if (!icon_set) {
+        g_clear_error(&icon_error);
+      }
+      g_free(bundled);
+      g_free(exe_dir);
+    }
+    if (!icon_set) {
+      icon_set = gtk_window_set_icon_from_file(
+          window, "/home/aqeel-gill/.local/share/icons/cineflow_logo_4color.png",
+          &icon_error);
+      if (!icon_set) {
+        g_clear_error(&icon_error);
+      }
+    }
+    if (!icon_set) {
+      icon_set = gtk_window_set_icon_from_file(
+          window,
+          "/home/aqeel-gill/cineflow_flutter/assets/logo/cineflow_logo_4color.png",
+          &icon_error);
+      g_clear_error(&icon_error);
+    }
+  }
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(
@@ -121,7 +163,7 @@ MyApplication* my_application_new() {
   // like GTK and desktop environments map this running application to its
   // corresponding .desktop file. This ensures better integration by allowing
   // the application to be recognized beyond its binary name.
-  g_set_prgname(APPLICATION_ID);
+  g_set_prgname("cineflow_flutter");
 
   return MY_APPLICATION(g_object_new(my_application_get_type(),
                                      "application-id", APPLICATION_ID, "flags",

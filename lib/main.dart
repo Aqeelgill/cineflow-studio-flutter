@@ -8,15 +8,34 @@ import 'package:flutter/services.dart';
 import 'package:html/parser.dart' as html_parser;
 import 'package:http/http.dart' as http;
 
+import 'core/app_categories.dart';
+import 'core/app_i18n.dart';
+import 'core/download_paths.dart';
+import 'core/ram_guard.dart';
 import 'engine/download_engine.dart';
+import 'services/ram_guard_service.dart';
+import 'services/telegram_bot_service.dart';
+import 'widgets/telegram_bot_panel.dart';
+import 'widgets/ui_effects.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const CineFlowApp());
 }
 
-class CineFlowApp extends StatelessWidget {
+class CineFlowApp extends StatefulWidget {
   const CineFlowApp({super.key});
+
+  @override
+  State<CineFlowApp> createState() => _CineFlowAppState();
+}
+
+class _CineFlowAppState extends State<CineFlowApp> {
+  @override
+  void initState() {
+    super.initState();
+    HandCursorProvider.load();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -25,6 +44,10 @@ class CineFlowApp extends StatelessWidget {
       secondary: Color(0xFF10B981),
       surface: Color(0xFF111827),
       error: Color(0xFFEF4444),
+    );
+    final baseBorder = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(8),
+      borderSide: const BorderSide(color: Colors.transparent),
     );
     return MaterialApp(
       title: 'CineFlow Studio — Universal Suite',
@@ -38,18 +61,12 @@ class CineFlowApp extends StatelessWidget {
           isDense: true,
           filled: true,
           fillColor: const Color(0xFF0B1220),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(8),
-            borderSide: const BorderSide(color: Color(0xFF1F2937)),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(8),
-            borderSide: const BorderSide(color: Color(0xFF1F2937)),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(8),
-            borderSide: const BorderSide(color: Color(0xFF06B6D4)),
-          ),
+          border: baseBorder,
+          enabledBorder: baseBorder,
+          focusedBorder: baseBorder,
+          disabledBorder: baseBorder,
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
         ),
         checkboxTheme: CheckboxThemeData(
           fillColor: WidgetStateProperty.resolveWith((s) {
@@ -103,21 +120,67 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
   Timer? _schedulerTimer;
   String _seriesWatchUrl = '';
 
+  // RAM guard
+  final RamGuardService _ramGuard = RamGuardService(initialMode: RamMode.standard);
+  StreamSubscription<RamDecision>? _ramSub;
+  int _ramPercent = 0;
+  RamMode _ramMode = RamMode.standard;
+  bool _showRamBanner = false;
+
+  // Telegram bot
+  final TelegramBotService _telegram = TelegramBotService();
+  Locale _locale = const Locale('en', 'US');
+  AppCategory _selectedCategory = AppCategories.webSeries;
+
+  int get _concurrencyLimit => RamGuard.evaluate(_ramPercent, _ramMode).allowedConcurrency;
+
   @override
   void initState() {
     super.initState();
     _initDir();
-    _schedulerTimer = Timer.periodic(const Duration(seconds: 30), (_) => _tickScheduler());
+    _schedulerTimer =
+        Timer.periodic(const Duration(seconds: 30), (_) => _tickScheduler());
+    _ramGuard.start();
+    _ramSub = _ramGuard.stream.listen((s) {
+      if (!mounted) return;
+      setState(() {
+        _ramPercent = s.usedPercent;
+        _showRamBanner = s.alert;
+      });
+      _pumpQueue();
+    });
+    _wireTelegram();
+  }
+
+  void _wireTelegram() {
+    _telegram.setDownloadManagerReady(true);
+    _telegram.setLocale(_locale);
+    _telegram.onStatus = _botStatus;
+    _telegram.onDownload = _botAddUrl;
+    _telegram.onPause = _botPause;
+    _telegram.onResume = _botResume;
+    _telegram.onHelp = () async => _botHelp();
+    _telegram.addListener(_onTelegramChanged);
+    _telegram.loadEnv();
+  }
+
+  void _onTelegramChanged() {
+    if (mounted) setState(() {});
   }
 
   Future<void> _initDir() async {
-    final dir = await _engine.getDefaultSaveDirectory();
+    final dir = _engine.getDefaultSaveDirectory();
+    await DownloadPaths.ensureAllCategoryDirs(dir, isWindows: Platform.isWindows);
     if (mounted) setState(() => _saveDir = dir);
   }
 
   @override
   void dispose() {
     _schedulerTimer?.cancel();
+    _ramSub?.cancel();
+    _ramGuard.dispose();
+    _telegram.removeListener(_onTelegramChanged);
+    _telegram.dispose();
     _urlController.dispose();
     _seriesUrlController.dispose();
     _scrapeUrlController.dispose();
@@ -134,6 +197,34 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
 
   void _refresh() {
     if (mounted) setState(() {});
+    _pumpQueue();
+  }
+
+  // ---------- Concurrency / RAM Guard ----------
+  void _pumpQueue() {
+    final decision = RamGuard.evaluate(_ramPercent, _ramMode);
+    if (decision.shouldPauseNewStarts) return;
+    final active = _queue.where((i) => i.status == 'Downloading').length;
+    if (active >= decision.allowedConcurrency) return;
+    final pending = _queue
+        .where((i) => i.status == 'Queued')
+        .take(decision.allowedConcurrency - active)
+        .toList();
+    for (final item in pending) {
+      _engine.startDownload(item, _saveDir, _refresh, maxConcurrentChunks: decision.allowedConcurrency);
+    }
+  }
+
+  void _enqueueStart(DownloadItem item) {
+    if (item.status == 'Completed') return;
+    item.error = null;
+    final decision = RamGuard.evaluate(_ramPercent, _ramMode);
+    final active = _queue.where((i) => i.status == 'Downloading').length;
+    if (!decision.shouldPauseNewStarts && active < decision.allowedConcurrency) {
+      _engine.startDownload(item, _saveDir, _refresh, maxConcurrentChunks: decision.allowedConcurrency);
+    } else {
+      setState(() => item.status = 'Queued');
+    }
   }
 
   // ---------- Tab 1: Universal Downloader ----------
@@ -161,6 +252,7 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
           title: Uri.tryParse(u)?.pathSegments.lastWhere((s) => s.isNotEmpty, orElse: () => u) ?? u,
           platform: direct ? 'Direct File' : 'Web Video',
           quality: _addQuality,
+          category: _selectedCategory,
         ));
       }
       _urlController.clear();
@@ -181,9 +273,13 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
           _queue.add(DownloadItem(
             id: _newId(l),
             url: l,
-            title: Uri.tryParse(l)?.pathSegments.lastWhere((s) => s.isNotEmpty, orElse: () => l) ?? l,
+            title: Uri.tryParse(l)
+                    ?.pathSegments
+                    .lastWhere((s) => s.isNotEmpty, orElse: () => l) ??
+                l,
             platform: _engine.isDirectFile(l) ? 'Direct File' : 'Scanned',
             quality: _addQuality,
+            category: _selectedCategory,
           ));
         }
       });
@@ -214,6 +310,7 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                 l,
             platform: _engine.isDirectFile(l) ? 'Direct File' : 'Parsed Link',
             quality: _addQuality,
+            category: _selectedCategory,
           ));
         }
       });
@@ -252,7 +349,7 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
       return;
     }
     for (final item in items) {
-      _startOrResume(item);
+      _enqueueStart(item);
     }
   }
 
@@ -267,7 +364,9 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
   }
 
   void _pauseSelectedOrRunning() {
-    final targets = _queue.where((i) => i.selected || i.status == 'Downloading').toList();
+    final targets = _queue
+        .where((i) => i.selected || i.status == 'Downloading')
+        .toList();
     for (final item in targets) {
       _engine.pauseItem(item);
     }
@@ -275,13 +374,17 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
   }
 
   void _resumeSelected() {
-    final items = _queue.where((i) => i.selected && (i.status == 'Paused' || i.status.startsWith('Failed'))).toList();
+    final items = _queue
+        .where((i) =>
+            i.selected &&
+            (i.status == 'Paused' || i.status.startsWith('Failed')))
+        .toList();
     if (items.isEmpty) {
       _showSnack('No paused/failed selected items');
       return;
     }
     for (final item in items) {
-      _startOrResume(item);
+      _enqueueStart(item);
     }
   }
 
@@ -298,13 +401,12 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
       item.status = 'Queued';
       item.error = null;
       item.paused = false;
-      _engine.startDownload(item, _saveDir, _refresh);
+      _enqueueStart(item);
     }
   }
 
   void _startOrResume(DownloadItem item) {
-    if (item.status == 'Completed') return;
-    _engine.startDownload(item, _saveDir, _refresh);
+    _enqueueStart(item);
   }
 
   Future<void> _openFolder() async {
@@ -322,6 +424,40 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
     } catch (e) {
       _showSnack('Open folder error: $e');
     }
+  }
+
+  Future<void> _editSource(DownloadItem item) async {
+    final urlCtrl = TextEditingController(text: item.url);
+    final proxyCtrl = TextEditingController(text: item.proxyUrl ?? '');
+    final headersCtrl = TextEditingController(text: item.headers.entries.map((e) => '${e.key}: ${e.value}').join('\n'));
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF111827),
+        title: Text(AppI18n.t('edit_source', _locale)),
+        content: SizedBox(width: 560, child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: urlCtrl, decoration: const InputDecoration(labelText: 'URL')),
+          const SizedBox(height: 8),
+          TextField(controller: proxyCtrl, decoration: const InputDecoration(labelText: 'Proxy (http://host:port)')),
+          const SizedBox(height: 8),
+          TextField(controller: headersCtrl, minLines: 3, maxLines: 6, decoration: const InputDecoration(labelText: 'Headers (Key: Value per line)')),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(AppI18n.t('cancel', _locale))),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: Text(AppI18n.t('save', _locale))),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final hdrs = <String, String>{};
+    for (final line in headersCtrl.text.split(RegExp(r'\r?\n'))) {
+      final idx = line.indexOf(':');
+      if (idx <= 0) continue;
+      hdrs[line.substring(0, idx).trim()] = line.substring(idx + 1).trim();
+    }
+    setState(() {
+      _engine.updateTaskSource(item, newUrl: urlCtrl.text, newHeaders: hdrs, proxyUrl: proxyCtrl.text);
+    });
   }
 
   // ---------- Tab 2: Series & Drama ----------
@@ -365,11 +501,10 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
         title: ep.title,
         platform: 'Series',
         quality: _seriesQuality,
+        category: _selectedCategory,
       );
       _queue.add(item);
-      if (startNow) {
-        _engine.startDownload(item, _saveDir, _refresh);
-      }
+      if (startNow) _enqueueStart(item);
     }
     _showSnack('${selected.length} episodes sent to Downloader');
     setState(() => _selectedTab = 0);
@@ -383,7 +518,8 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
       return;
     }
     final urlReg = RegExp(r'https?://[^\s<>"\x27]+', caseSensitive: false);
-    final urls = urlReg.allMatches(raw).map((m) => m.group(0)!).toSet().toList();
+    final urls =
+        urlReg.allMatches(raw).map((m) => m.group(0)!).toSet().toList();
     if (urls.isEmpty) {
       _showSnack('No valid URLs found');
       return;
@@ -407,7 +543,8 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
         final base = Uri.parse(u);
 
         if (_scrapeEmails) {
-          final re = RegExp(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', caseSensitive: false);
+          final re = RegExp(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}',
+              caseSensitive: false);
           for (final m in re.allMatches(body)) {
             final v = m.group(0)!;
             final key = 'email:$v';
@@ -417,7 +554,10 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
           }
           for (final a in doc.querySelectorAll('a[href^="mailto:"]')) {
             final href = a.attributes['href'] ?? '';
-            final v = href.replaceFirst(RegExp(r'^mailto:', caseSensitive: false), '').split('?').first;
+            final v = href
+                .replaceFirst(RegExp(r'^mailto:', caseSensitive: false), '')
+                .split('?')
+                .first;
             if (v.isNotEmpty && seen.add('email:$v')) {
               results.add(ScrapeResult(type: 'Email', value: v, source: u));
             }
@@ -454,7 +594,8 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                   low.contains('t.me')) {
                 final key = 'social:$abs';
                 if (seen.add(key)) {
-                  results.add(ScrapeResult(type: 'Social', value: abs, source: u));
+                  results
+                      .add(ScrapeResult(type: 'Social', value: abs, source: u));
                 }
               }
             } catch (_) {}
@@ -462,16 +603,20 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
         }
 
         if (_scrapeMedia) {
-          for (final el in doc.querySelectorAll('a[href], img[src], video[src], source[src]')) {
-            final rawLink = el.attributes['href'] ?? el.attributes['src'] ?? '';
+          for (final el in doc
+              .querySelectorAll('a[href], img[src], video[src], source[src]')) {
+            final rawLink =
+                el.attributes['href'] ?? el.attributes['src'] ?? '';
             if (rawLink.isEmpty) continue;
             try {
               final abs = base.resolve(rawLink).toString();
               final path = Uri.parse(abs).path.toLowerCase();
-              if (UniversalDownloadEngine.directExts.any((ext) => path.endsWith(ext))) {
+              if (UniversalDownloadEngine.directExts
+                  .any((ext) => path.endsWith(ext))) {
                 final key = 'media:$abs';
                 if (seen.add(key)) {
-                  results.add(ScrapeResult(type: 'Media/Doc', value: abs, source: u));
+                  results.add(
+                      ScrapeResult(type: 'Media/Doc', value: abs, source: u));
                 }
               }
             } catch (_) {}
@@ -560,9 +705,13 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
         _queue.add(DownloadItem(
           id: _newId(m.value),
           url: m.value,
-          title: Uri.tryParse(m.value)?.pathSegments.lastWhere((s) => s.isNotEmpty, orElse: () => m.value) ?? m.value,
+          title: Uri.tryParse(m.value)
+                  ?.pathSegments
+                  .lastWhere((s) => s.isNotEmpty, orElse: () => m.value) ??
+              m.value,
           platform: 'Scraped Media',
           quality: _addQuality,
+          category: _selectedCategory,
         ));
       }
       _selectedTab = 0;
@@ -576,10 +725,12 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
       context: context,
       builder: (ctx) => SimpleDialog(
         title: const Text('Select Job Type'),
-        children: JobType.values.map((t) => SimpleDialogOption(
-          onPressed: () => Navigator.pop(ctx, t),
-          child: Text(t.label),
-        )).toList(),
+        children: JobType.values
+            .map((t) => SimpleDialogOption(
+                  onPressed: () => Navigator.pop(ctx, t),
+                  child: Text(t.label),
+                ))
+            .toList(),
       ),
     );
     if (type == null || !mounted) return;
@@ -588,16 +739,18 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
     final date = await showDatePicker(
       context: context,
       initialDate: now,
-      firstDate: now.subtract(const Duration(days: 0)),
+      firstDate: now,
       lastDate: now.add(const Duration(days: 365 * 5)),
     );
     if (date == null || !mounted) return;
     final time = await showTimePicker(
       context: context,
-      initialTime: TimeOfDay.fromDateTime(now.add(const Duration(minutes: 1))),
+      initialTime:
+          TimeOfDay.fromDateTime(now.add(const Duration(minutes: 1))),
     );
     if (time == null || !mounted) return;
-    DateTime scheduled = DateTime(date.year, date.month, date.day, time.hour, time.minute);
+    DateTime scheduled =
+        DateTime(date.year, date.month, date.day, time.hour, time.minute);
     if (scheduled.isBefore(DateTime.now())) {
       scheduled = DateTime.now().add(const Duration(minutes: 1));
     }
@@ -606,10 +759,12 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
       context: context,
       builder: (ctx) => SimpleDialog(
         title: const Text('Repeat Interval'),
-        children: RepeatInterval.values.map((r) => SimpleDialogOption(
-          onPressed: () => Navigator.pop(ctx, r),
-          child: Text(r.label),
-        )).toList(),
+        children: RepeatInterval.values
+            .map((r) => SimpleDialogOption(
+                  onPressed: () => Navigator.pop(ctx, r),
+                  child: Text(r.label),
+                ))
+            .toList(),
       ),
     );
     if (interval == null || !mounted) return;
@@ -670,7 +825,7 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                 quality: _seriesQuality,
               );
               _queue.add(item);
-              _engine.startDownload(item, _saveDir, _refresh);
+              _enqueueStart(item);
             }
           }
           break;
@@ -688,35 +843,104 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
       if (item.status == 'Queued' ||
           item.status == 'Paused' ||
           item.status.startsWith('Failed')) {
-        _engine.startDownload(item, _saveDir, _refresh);
+        _enqueueStart(item);
       }
     }
+    _pumpQueue();
+  }
+
+  // ---------- Telegram Bot handlers ----------
+  Future<String> _botStatus() async {
+    final decision = RamGuard.evaluate(_ramPercent, _ramMode);
+    final active = _queue.where((i) => i.status == 'Downloading').length;
+    final queued = _queue.where((i) => i.status == 'Queued').length;
+    final paused = _queue.where((i) => i.status == 'Paused').length;
+    final failed = _queue.where((i) => i.status.startsWith('Failed')).length;
+    final completed = _queue.where((i) => i.status == 'Completed').length;
+    return """${AppI18n.t('status', _locale)}: CineFlow
+${AppI18n.t('ram', _locale)}: $_ramPercent% (${_ramMode.label}, limit ${decision.allowedConcurrency})
+Active: $active
+Queued: $queued
+Paused: $paused
+Failed: $failed
+Completed: $completed
+Category root: $_saveDir""";
+  }
+
+  Future<String> _botAddUrl(String url) async {
+    final u = url.trim();
+    if (!u.startsWith('http')) return 'Invalid URL';
+    final direct = _engine.isDirectFile(u);
+    final item = DownloadItem(
+      id: _newId(u),
+      url: u,
+      title: Uri.tryParse(u)?.pathSegments.lastWhere((s) => s.isNotEmpty, orElse: () => u) ?? u,
+      platform: direct ? 'Direct File' : 'Web Video',
+      quality: _addQuality,
+      category: _selectedCategory,
+    );
+    setState(() => _queue.add(item));
+    _enqueueStart(item);
+    return '${AppI18n.t('download_all', _locale)}: queued 1 (${item.category.label}) -> ${item.title}';
+  }
+
+  Future<String> _botPause() async {
+    for (final item in _queue.where((i) => i.status == 'Downloading')) {
+      _engine.pauseItem(item);
+    }
+    _refresh();
+    return AppI18n.t('pause', _locale);
+  }
+
+  Future<String> _botResume() async {
+    int count = 0;
+    for (final item in _queue) {
+      if (item.status == 'Paused' || item.status.startsWith('Failed') || item.status == 'Queued') {
+        item.status = 'Queued';
+        count++;
+      }
+    }
+    _pumpQueue();
+    _refresh();
+    return '${AppI18n.t('resume', _locale)}: $count';
+  }
+
+  String _botHelp() {
+    return '${AppI18n.t('help', _locale)}:\n/status\n/pause\n/resume\n/download <URL>\n/help';
+  }
+
+  void _openTelegramPanel() {
+    _telegram.clearUnread();
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => SizedBox(
+        height: MediaQuery.of(context).size.height * 0.85,
+        child: TelegramBotPanel(service: _telegram),
+      ),
+    );
   }
 
   // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    final decision = RamGuard.evaluate(_ramPercent, _ramMode);
+    final dir = AppI18n.isRtl(_locale) ? TextDirection.rtl : TextDirection.ltr;
+    return Directionality(
+      textDirection: dir,
+      child: Scaffold(
       appBar: AppBar(
         backgroundColor: const Color(0xFF0F172A),
         elevation: 0,
-        title: Row(
-          children: [
-            const Text('CineFlow Studio',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
-            const SizedBox(width: 10),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: const Color(0xFF06B6D4).withValues(alpha: 0.2),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFF06B6D4)),
-              ),
-              child: const Text('DARK FIGMA STUDIO',
-                  style: TextStyle(fontSize: 10, color: Color(0xFF22D3EE))),
-            ),
-          ],
-        ),
+        titleSpacing: 16,
+        title: const GradientTitle(),
+        actions: [
+          Padding(padding: const EdgeInsets.only(right: 8), child: Center(child: _languagePicker())),
+          Padding(padding: const EdgeInsets.only(right: 8), child: Center(child: _ramModePicker())),
+          Padding(padding: const EdgeInsets.only(right: 8), child: Center(child: _telegramButton())),
+          Padding(padding: const EdgeInsets.only(right: 16), child: Center(child: _ramPill(decision.alert))),
+        ],
       ),
       body: Column(
         children: [
@@ -728,18 +952,186 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: [
-                  _tabChip(0, '1. Universal Downloader'),
-                  _tabChip(1, '2. Series & Drama Watcher'),
-                  _tabChip(2, '3. Lead Generator & Media Scraper'),
-                  _tabChip(3, '4. Task Scheduler'),
+                  _tabChip(0, '1. ${AppI18n.t('tab_downloader', _locale)}'),
+                  _tabChip(1, '2. ${AppI18n.t('tab_series', _locale)}'),
+                  _tabChip(2, '3. ${AppI18n.t('tab_leads', _locale)}'),
+                  _tabChip(3, '4. ${AppI18n.t('tab_scheduler', _locale)}'),
                 ],
               ),
             ),
           ),
+          if (_showRamBanner)
+            Container(
+              width: double.infinity,
+              color: const Color(0xFF450A0A),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Row(
+                children: [
+                  const Icon(Icons.warning_amber_rounded, color: Color(0xFFFCA5A5)),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'RAM ${_ramPercent}% reached 65% limit. Concurrency reduced/paused; system RAM is not restarted. RAM limits are targets, not guarantees.',
+                      style: const TextStyle(color: Color(0xFFFCA5A5)),
+                    ),
+                  ),
+                  ClickableRegion(
+                    child: IconButton(
+                      icon: const Icon(Icons.close, color: Color(0xFFFCA5A5)),
+                      onPressed: () => setState(() => _showRamBanner = false),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           const Divider(height: 1),
-          Expanded(child: _buildTab()),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                return Stack(
+                  children: [
+                    Center(
+                      child: IgnorePointer(
+                        child: Opacity(
+                          opacity: 0.08,
+                          child: Image.asset(
+                            'assets/logo/cineflow_logo.png',
+                            height: constraints.maxHeight * 0.35,
+                            fit: BoxFit.contain,
+                          ),
+                        ),
+                      ),
+                    ),
+                    _buildTab(),
+                  ],
+                );
+              },
+            ),
+          ),
         ],
       ),
+    ),
+    );
+  }
+
+  Widget _languagePicker() {
+    return DropdownButtonHideUnderline(
+      child: DropdownButton<Locale>(
+        value: _locale,
+        dropdownColor: const Color(0xFF111827),
+        iconEnabledColor: const Color(0xFF06B6D4),
+        items: AppI18n.supported.map((l) => DropdownMenuItem(value: l, child: Text(AppI18n.codeOf(l), style: const TextStyle(fontSize: 12)))).toList(),
+        onChanged: (l) {
+          if (l == null) return;
+          setState(() => _locale = l);
+          _telegram.setLocale(l);
+        },
+      ),
+    );
+  }
+
+  Widget _ramModePicker() {
+    return DropdownButtonHideUnderline(
+      child: DropdownButton<RamMode>(
+        value: _ramMode,
+        dropdownColor: const Color(0xFF111827),
+        iconEnabledColor: const Color(0xFF10B981),
+        items: RamMode.values.map((m) => DropdownMenuItem(value: m, child: Text(m.label, style: const TextStyle(fontSize: 12)))).toList(),
+        onChanged: (m) {
+          if (m == null) return;
+          setState(() => _ramMode = m);
+          _ramGuard.setMode(m);
+          _pumpQueue();
+        },
+      ),
+    );
+  }
+
+  Widget _telegramButton() {
+    final connected = _telegram.isConnected;
+    final err = _telegram.state == BotConnectionState.error;
+    final dotColor = connected
+        ? const Color(0xFF10B981)
+        : err
+            ? const Color(0xFFEF4444)
+            : Colors.white38;
+    final unread = _telegram.unread;
+    return ClickableRegion(
+      child: Tooltip(
+        message: connected ? 'Telegram Bot Connected' : 'Telegram Bot',
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          onTap: _openTelegramPanel,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 150),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF111827),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF1F2937)),
+            ),
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.smart_toy_rounded,
+                        size: 18, color: Color(0xFF06B6D4)),
+                    const SizedBox(width: 6),
+                    Container(
+                      width: 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        color: dotColor,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                  ],
+                ),
+                if (unread > 0)
+                  Positioned(
+                    right: -10,
+                    top: -10,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFEF4444),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Text(
+                        unread > 9 ? '9+' : '$unread',
+                        style: const TextStyle(
+                            fontSize: 9,
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _ramPill(bool high) {
+    final decision = RamGuard.evaluate(_ramPercent, _ramMode);
+    final bg = high ? const Color(0xFF450A0A) : const Color(0xFF052E1F);
+    final fg = high ? const Color(0xFFFCA5A5) : const Color(0xFF34D399);
+    final border = high ? const Color(0xFF7F1D1D) : const Color(0xFF065F46);
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(20), border: Border.all(color: border)),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(Icons.memory, size: 16, color: fg),
+        const SizedBox(width: 6),
+        Text('RAM: ${_ramPercent.toString().padLeft(2, '0')}% ${_ramMode.label}',
+            style: TextStyle(color: fg, fontWeight: FontWeight.w700, fontSize: 12)),
+        if (decision.shouldReduceConcurrency) ...[const SizedBox(width: 6), Text('DL ${decision.allowedConcurrency}', style: TextStyle(color: fg, fontSize: 10))],
+      ]),
     );
   }
 
@@ -747,17 +1139,30 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
     final active = _selectedTab == index;
     return Padding(
       padding: const EdgeInsets.only(right: 8),
-      child: ChoiceChip(
-        label: Text(label),
-        selected: active,
-        selectedColor: const Color(0xFF164E63),
-        backgroundColor: const Color(0xFF111827),
-        side: BorderSide(color: active ? const Color(0xFF06B6D4) : const Color(0xFF1F2937)),
-        labelStyle: TextStyle(
-          color: active ? const Color(0xFF22D3EE) : Colors.white70,
-          fontWeight: active ? FontWeight.w600 : FontWeight.normal,
+      child: ClickableRegion(
+        child: HoverGlow(
+          baseColor:
+              active ? const Color(0xFF164E63) : const Color(0xFF111827),
+          hoverColor:
+              active ? const Color(0xFF155E75) : const Color(0xFF162033),
+          borderColor:
+              active ? const Color(0xFF06B6D4) : const Color(0xFF1F2937),
+          hoverBorderColor: const Color(0xFF22D3EE),
+          borderRadius: BorderRadius.circular(20),
+          child: ChoiceChip(
+            label: Text(label),
+            selected: active,
+            selectedColor: Colors.transparent,
+            backgroundColor: Colors.transparent,
+            surfaceTintColor: Colors.transparent,
+            side: const BorderSide(color: Colors.transparent),
+            labelStyle: TextStyle(
+              color: active ? const Color(0xFF22D3EE) : Colors.white70,
+              fontWeight: active ? FontWeight.w600 : FontWeight.normal,
+            ),
+            onSelected: (_) => setState(() => _selectedTab = index),
+          ),
         ),
-        onSelected: (_) => setState(() => _selectedTab = index),
       ),
     );
   }
@@ -788,35 +1193,47 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _urlController,
-                        decoration: const InputDecoration(
-                          hintText: 'Paste video, document, or webpage URL...',
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(minWidth: 280, maxWidth: 520),
+                      child: FocusGlow(
+                        child: TextField(
+                          controller: _urlController,
+                          decoration: const InputDecoration(hintText: 'Paste video, document, or webpage URL...'),
+                          onSubmitted: (_) => _pasteAndAdd(),
                         ),
-                        onSubmitted: (_) => _pasteAndAdd(),
                       ),
                     ),
-                    const SizedBox(width: 8),
                     SizedBox(
                       width: 150,
-                      child: DropdownButtonFormField<DownloadQuality>(
-                        initialValue: _addQuality,
-                        isExpanded: true,
-                        decoration: const InputDecoration(labelText: 'Quality'),
-                        items: DownloadQuality.values
-                            .map((q) => DropdownMenuItem(value: q, child: Text(q.label)))
-                            .toList(),
-                        onChanged: (v) => setState(() => _addQuality = v ?? _addQuality),
+                      child: FocusGlow(
+                        child: DropdownButtonFormField<DownloadQuality>(
+                          initialValue: _addQuality,
+                          isExpanded: true,
+                          decoration: const InputDecoration(labelText: 'Quality'),
+                          items: DownloadQuality.values.map((q) => DropdownMenuItem(value: q, child: Text(q.label))).toList(),
+                          onChanged: (v) => setState(() => _addQuality = v ?? _addQuality),
+                        ),
                       ),
                     ),
-                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 180,
+                      child: FocusGlow(
+                        child: DropdownButtonFormField<AppCategory>(
+                          initialValue: _selectedCategory,
+                          isExpanded: true,
+                          decoration: InputDecoration(labelText: AppI18n.t('category', _locale)),
+                          items: AppCategories.all.map((c) => DropdownMenuItem(value: c, child: Text(c.label, overflow: TextOverflow.ellipsis))).toList(),
+                          onChanged: (v) => setState(() => _selectedCategory = v ?? _selectedCategory),
+                        ),
+                      ),
+                    ),
                     _btnPrimary('Paste & Add', _pasteAndAdd, color: const Color(0xFF06B6D4)),
-                    const SizedBox(width: 6),
                     _btnOutline('Scan Page', _scanPage),
-                    const SizedBox(width: 6),
                     _btnOutline('Attach File', _attachFile),
                   ],
                 ),
@@ -829,22 +1246,25 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                     Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Checkbox(
-                          value: allSelected,
-                          onChanged: (v) {
-                            setState(() {
-                              for (final i in _queue) {
-                                i.selected = v ?? false;
-                              }
-                            });
-                          },
+                        _clickBox(
+                          child: Checkbox(
+                            value: allSelected,
+                            onChanged: (v) {
+                              setState(() {
+                                for (final i in _queue) {
+                                  i.selected = v ?? false;
+                                }
+                              });
+                            },
+                          ),
                         ),
-                        const Text('Select All', style: TextStyle(fontSize: 13)),
+                        const Text('Select All',
+                            style: TextStyle(fontSize: 13)),
                       ],
                     ),
-                    _btnPrimary('Download Selected', _downloadSelected, color: const Color(0xFF10B981)),
-                    _btnOutline('Pause', _pauseSelectedOrRunning),
-                    _btnOutline('Resume', _resumeSelected),
+                    _btnPrimary(AppI18n.t('download_all', _locale), _downloadSelected, color: const Color(0xFF10B981)),
+                    _btnOutline(AppI18n.t('pause', _locale), _pauseSelectedOrRunning),
+                    _btnOutline(AppI18n.t('resume', _locale), _resumeSelected),
                     _btnOutline('Restart', _restartSelected),
                     _btnDanger('Delete Selected', _deleteSelected),
                     _btnOutline('Browse Folder', _browseFolder),
@@ -852,15 +1272,16 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                   ],
                 ),
                 const SizedBox(height: 8),
-                Text('Save Folder: ${_saveDir.isEmpty ? '...' : _saveDir}',
-                    style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                Text('Save Folder: ${_saveDir.isEmpty ? '...' : _saveDir}   •   Concurrency: $_concurrencyLimit DL${RamGuard.evaluate(_ramPercent,_ramMode).shouldReduceConcurrency ? ' (Guard)' : ''}', style: const TextStyle(fontSize: 11, color: Colors.white54)),
               ],
             ),
           ),
           const SizedBox(height: 12),
           Expanded(
             child: _queue.isEmpty
-                ? const Center(child: Text('No downloads in queue', style: TextStyle(color: Colors.white38)))
+                ? const Center(
+                    child: Text('No downloads in queue',
+                        style: TextStyle(color: Colors.white38)))
                 : ListView.builder(
                     itemCount: _queue.length,
                     itemBuilder: (context, i) => _downloadTile(_queue[i]),
@@ -894,9 +1315,11 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Checkbox(
-              value: item.selected,
-              onChanged: (v) => setState(() => item.selected = v ?? false),
+            _clickBox(
+              child: Checkbox(
+                value: item.selected,
+                onChanged: (v) => setState(() => item.selected = v ?? false),
+              ),
             ),
             Expanded(
               child: Column(
@@ -908,19 +1331,23 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                         child: Text(item.title,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w600)),
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w600)),
                       ),
                       const SizedBox(width: 8),
                       _badge(item.platform, const Color(0xFF06B6D4)),
                       const SizedBox(width: 6),
                       _badge(item.quality.label, const Color(0xFF10B981)),
+                      const SizedBox(width: 6),
+                      _badge(item.category.label, const Color(0xFF9B72CB)),
                     ],
                   ),
                   const SizedBox(height: 4),
                   Text(item.url,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontSize: 11, color: Colors.white38)),
+                      style: const TextStyle(
+                          fontSize: 11, color: Colors.white38)),
                   const SizedBox(height: 6),
                   Row(
                     children: [
@@ -931,28 +1358,34 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                             value: pct / 100.0,
                             minHeight: 7,
                             backgroundColor: const Color(0xFF1F2937),
-                            valueColor: AlwaysStoppedAnimation<Color>(statusColor),
+                            valueColor:
+                                AlwaysStoppedAnimation<Color>(statusColor),
                           ),
                         ),
                       ),
                       const SizedBox(width: 10),
                       Text('${pct.toStringAsFixed(1)}%',
-                          style: const TextStyle(fontSize: 12, color: Colors.white70)),
+                          style: const TextStyle(
+                              fontSize: 12, color: Colors.white70)),
                     ],
                   ),
                   const SizedBox(height: 4),
                   Row(
                     children: [
-                      Text(item.status, style: TextStyle(fontSize: 12, color: statusColor)),
+                      Text(item.status,
+                          style: TextStyle(fontSize: 12, color: statusColor)),
                       const SizedBox(width: 12),
-                      Text(item.speed, style: const TextStyle(fontSize: 12, color: Colors.white54)),
+                      Text(item.speed,
+                          style: const TextStyle(
+                              fontSize: 12, color: Colors.white54)),
                       if (item.error != null && item.error!.isNotEmpty) ...[
                         const SizedBox(width: 12),
                         Expanded(
                           child: Text(item.error!,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontSize: 11, color: Color(0xFFEF4444))),
+                              style: const TextStyle(
+                                  fontSize: 11, color: Color(0xFFEF4444))),
                         ),
                       ],
                     ],
@@ -965,55 +1398,31 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
               children: [
                 SizedBox(
                   width: 140,
-                  child: DropdownButtonFormField<DownloadQuality>(
-                    initialValue: item.quality,
-                    isExpanded: true,
-                    decoration: const InputDecoration(labelText: 'Quality'),
-                    items: DownloadQuality.values
-                        .map((q) => DropdownMenuItem(value: q, child: Text(q.label, style: const TextStyle(fontSize: 12))))
-                        .toList(),
-                    onChanged: (v) => setState(() => item.quality = v ?? item.quality),
+                  child: FocusGlow(
+                    child: DropdownButtonFormField<DownloadQuality>(
+                      initialValue: item.quality,
+                      isExpanded: true,
+                      decoration: const InputDecoration(labelText: 'Quality'),
+                      items: DownloadQuality.values
+                          .map((q) => DropdownMenuItem(
+                              value: q,
+                              child: Text(q.label,
+                                  style: const TextStyle(fontSize: 12))))
+                          .toList(),
+                      onChanged: (v) =>
+                          setState(() => item.quality = v ?? item.quality),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 6),
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    IconButton(
-                      tooltip: 'Start/Resume',
-                      icon: const Icon(Icons.play_arrow, color: Color(0xFF10B981)),
-                      onPressed: () => _startOrResume(item),
-                    ),
-                    IconButton(
-                      tooltip: 'Pause',
-                      icon: const Icon(Icons.pause, color: Colors.amber),
-                      onPressed: () {
-                        _engine.pauseItem(item);
-                        _refresh();
-                      },
-                    ),
-                    IconButton(
-                      tooltip: 'Restart',
-                      icon: const Icon(Icons.restart_alt, color: Color(0xFF06B6D4)),
-                      onPressed: () {
-                        _engine.pauseItem(item);
-                        setState(() {
-                          item.progress = 0;
-                          item.speed = '--';
-                          item.status = 'Queued';
-                          item.error = null;
-                        });
-                        _engine.startDownload(item, _saveDir, _refresh);
-                      },
-                    ),
-                    IconButton(
-                      tooltip: 'Delete',
-                      icon: const Icon(Icons.delete_outline, color: Color(0xFFEF4444)),
-                      onPressed: () {
-                        _engine.pauseItem(item);
-                        setState(() => _queue.remove(item));
-                      },
-                    ),
+                    _iconBtn(tooltip: 'Start/Resume', icon: Icons.play_arrow, color: const Color(0xFF10B981), onPressed: () => _startOrResume(item)),
+                    _iconBtn(tooltip: 'Pause', icon: Icons.pause, color: Colors.amber, onPressed: () { _engine.pauseItem(item); _refresh(); }),
+                    _iconBtn(tooltip: AppI18n.t('edit_source', _locale), icon: Icons.link, color: const Color(0xFFD96570), onPressed: () => _editSource(item)),
+                    _iconBtn(tooltip: 'Restart', icon: Icons.restart_alt, color: const Color(0xFF06B6D4), onPressed: () { _engine.pauseItem(item); setState(() { item.progress=0; item.speed='--'; item.status='Queued'; item.error=null; }); _enqueueStart(item); }),
+                    _iconBtn(tooltip: 'Delete', icon: Icons.delete_outline, color: const Color(0xFFEF4444), onPressed: () { _engine.pauseItem(item); setState(() => _queue.remove(item)); }),
                   ],
                 ),
               ],
@@ -1026,7 +1435,8 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
 
   // ---------- Series UI ----------
   Widget _buildSeriesTab() {
-    final allSelected = _episodes.isNotEmpty && _episodes.every((e) => e.selected);
+    final allSelected =
+        _episodes.isNotEmpty && _episodes.every((e) => e.selected);
     return Padding(
       padding: const EdgeInsets.all(14),
       child: Column(
@@ -1038,60 +1448,84 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                 Row(
                   children: [
                     Expanded(
-                      child: TextField(
-                        controller: _seriesUrlController,
-                        decoration: const InputDecoration(
-                          hintText: 'YouTube Playlist, Channel, or Show URL...',
+                      child: FocusGlow(
+                        child: TextField(
+                          controller: _seriesUrlController,
+                          decoration: const InputDecoration(
+                            hintText:
+                                'YouTube Playlist, Channel, or Show URL...',
+                          ),
+                          onSubmitted: (_) => _fetchEpisodes(),
                         ),
-                        onSubmitted: (_) => _fetchEpisodes(),
                       ),
                     ),
                     const SizedBox(width: 8),
                     SizedBox(
                       width: 150,
-                      child: DropdownButtonFormField<DownloadQuality>(
-                        initialValue: _seriesQuality,
-                        isExpanded: true,
-                        decoration: const InputDecoration(labelText: 'Quality'),
-                        items: DownloadQuality.values
-                            .map((q) => DropdownMenuItem(value: q, child: Text(q.label)))
-                            .toList(),
-                        onChanged: (v) => setState(() => _seriesQuality = v ?? _seriesQuality),
+                      child: FocusGlow(
+                        child: DropdownButtonFormField<DownloadQuality>(
+                          initialValue: _seriesQuality,
+                          isExpanded: true,
+                          decoration:
+                              const InputDecoration(labelText: 'Quality'),
+                          items: DownloadQuality.values
+                              .map((q) => DropdownMenuItem(
+                                  value: q, child: Text(q.label)))
+                              .toList(),
+                          onChanged: (v) => setState(
+                              () => _seriesQuality = v ?? _seriesQuality),
+                        ),
                       ),
                     ),
                     const SizedBox(width: 8),
-                    _btnPrimary('Fetch Episodes', _fetchingEpisodes ? null : _fetchEpisodes, color: const Color(0xFF06B6D4)),
+                    _btnPrimary('Fetch Episodes',
+                        _fetchingEpisodes ? null : _fetchEpisodes,
+                        color: const Color(0xFF06B6D4)),
                   ],
                 ),
                 const SizedBox(height: 10),
                 Row(
                   children: [
-                    Checkbox(
-                      value: allSelected,
-                      onChanged: _episodes.isEmpty ? null : (v) {
-                        setState(() {
-                          for (final e in _episodes) {
-                            e.selected = v ?? false;
-                          }
-                        });
-                      },
+                    _clickBox(
+                      child: Checkbox(
+                        value: allSelected,
+                        onChanged: _episodes.isEmpty
+                            ? null
+                            : (v) {
+                                setState(() {
+                                  for (final e in _episodes) {
+                                    e.selected = v ?? false;
+                                  }
+                                });
+                              },
+                      ),
                     ),
                     const Text('Select All'),
                     const SizedBox(width: 12),
-                    _btnPrimary('Download Selected / Season', _episodes.isEmpty ? null : () => _downloadSelectedEpisodes(startNow: true),
+                    _btnPrimary(
+                        'Download Selected / Season',
+                        _episodes.isEmpty
+                            ? null
+                            : () => _downloadSelectedEpisodes(startNow: true),
                         color: const Color(0xFF10B981)),
                     if (_fetchingEpisodes) ...[
                       const SizedBox(width: 12),
-                      const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                      const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2)),
                       const SizedBox(width: 8),
-                      const Text('Fetching...', style: TextStyle(color: Colors.white54)),
+                      const Text('Fetching...',
+                          style: TextStyle(color: Colors.white54)),
                     ],
                   ],
                 ),
                 if (_seriesError != null)
                   Padding(
                     padding: const EdgeInsets.only(top: 6),
-                    child: Text(_seriesError!, style: const TextStyle(color: Color(0xFFEF4444), fontSize: 12)),
+                    child: Text(_seriesError!,
+                        style: const TextStyle(
+                            color: Color(0xFFEF4444), fontSize: 12)),
                   ),
               ],
             ),
@@ -1099,7 +1533,9 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
           const SizedBox(height: 12),
           Expanded(
             child: _episodes.isEmpty
-                ? const Center(child: Text('No episodes loaded', style: TextStyle(color: Colors.white38)))
+                ? const Center(
+                    child: Text('No episodes loaded',
+                        style: TextStyle(color: Colors.white38)))
                 : ListView.builder(
                     itemCount: _episodes.length,
                     itemBuilder: (context, i) {
@@ -1111,13 +1547,22 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                           borderRadius: BorderRadius.circular(8),
                           side: const BorderSide(color: Color(0xFF1F2937)),
                         ),
-                        child: CheckboxListTile(
-                          value: ep.selected,
-                          onChanged: (v) => setState(() => ep.selected = v ?? false),
-                          controlAffinity: ListTileControlAffinity.leading,
-                          title: Text('${ep.index}. ${ep.title}', maxLines: 1, overflow: TextOverflow.ellipsis),
-                          subtitle: Text(ep.url, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11, color: Colors.white38)),
-                          secondary: _badge(ep.duration, const Color(0xFF06B6D4)),
+                        child: _clickBox(
+                          child: CheckboxListTile(
+                            value: ep.selected,
+                            onChanged: (v) =>
+                                setState(() => ep.selected = v ?? false),
+                            controlAffinity: ListTileControlAffinity.leading,
+                            title: Text('${ep.index}. ${ep.title}',
+                                maxLines: 1, overflow: TextOverflow.ellipsis),
+                            subtitle: Text(ep.url,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                    fontSize: 11, color: Colors.white38)),
+                            secondary:
+                                _badge(ep.duration, const Color(0xFF06B6D4)),
+                          ),
                         ),
                       );
                     },
@@ -1138,12 +1583,15 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                TextField(
-                  controller: _scrapeUrlController,
-                  minLines: 1,
-                  maxLines: 3,
-                  decoration: const InputDecoration(
-                    hintText: 'Target website URL(s) — space or newline separated...',
+                FocusGlow(
+                  child: TextField(
+                    controller: _scrapeUrlController,
+                    minLines: 1,
+                    maxLines: 3,
+                    decoration: const InputDecoration(
+                      hintText:
+                          'Target website URL(s) — space or newline separated...',
+                    ),
                   ),
                 ),
                 const SizedBox(height: 10),
@@ -1151,10 +1599,14 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                   spacing: 16,
                   runSpacing: 4,
                   children: [
-                    _checkLabel('Emails', _scrapeEmails, (v) => setState(() => _scrapeEmails = v)),
-                    _checkLabel('Phone Numbers', _scrapePhones, (v) => setState(() => _scrapePhones = v)),
-                    _checkLabel('Social Links', _scrapeSocial, (v) => setState(() => _scrapeSocial = v)),
-                    _checkLabel('Downloadable Media/Docs', _scrapeMedia, (v) => setState(() => _scrapeMedia = v)),
+                    _checkLabel('Emails', _scrapeEmails,
+                        (v) => setState(() => _scrapeEmails = v)),
+                    _checkLabel('Phone Numbers', _scrapePhones,
+                        (v) => setState(() => _scrapePhones = v)),
+                    _checkLabel('Social Links', _scrapeSocial,
+                        (v) => setState(() => _scrapeSocial = v)),
+                    _checkLabel('Downloadable Media/Docs', _scrapeMedia,
+                        (v) => setState(() => _scrapeMedia = v)),
                   ],
                 ),
                 const SizedBox(height: 10),
@@ -1162,22 +1614,34 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                   spacing: 8,
                   runSpacing: 8,
                   children: [
-                    _btnPrimary('Scrape', _scraping ? null : _runScrape, color: const Color(0xFF06B6D4)),
-                    _btnOutline('Export CSV', _scrapeResults.isEmpty ? null : _exportScrapeCsv),
-                    _btnPrimary('Send Media to Downloader', _scrapeResults.any((r) => r.type == 'Media/Doc') ? _sendScrapeMediaToDownloader : null,
+                    _btnPrimary('Scrape', _scraping ? null : _runScrape,
+                        color: const Color(0xFF06B6D4)),
+                    _btnOutline('Export CSV',
+                        _scrapeResults.isEmpty ? null : _exportScrapeCsv),
+                    _btnPrimary(
+                        'Send Media to Downloader',
+                        _scrapeResults.any((r) => r.type == 'Media/Doc')
+                            ? _sendScrapeMediaToDownloader
+                            : null,
                         color: const Color(0xFF10B981)),
                     if (_scraping) ...[
                       const SizedBox(width: 8),
-                      const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                      const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2)),
                       const SizedBox(width: 6),
-                      const Text('Scraping...', style: TextStyle(color: Colors.white54)),
+                      const Text('Scraping...',
+                          style: TextStyle(color: Colors.white54)),
                     ],
                   ],
                 ),
                 if (_scrapeError != null)
                   Padding(
                     padding: const EdgeInsets.only(top: 6),
-                    child: Text(_scrapeError!, style: const TextStyle(color: Color(0xFFEF4444), fontSize: 12)),
+                    child: Text(_scrapeError!,
+                        style: const TextStyle(
+                            color: Color(0xFFEF4444), fontSize: 12)),
                   ),
               ],
             ),
@@ -1185,19 +1649,24 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
           const SizedBox(height: 12),
           Expanded(
             child: _scrapeResults.isEmpty
-                ? const Center(child: Text('No scrape results', style: TextStyle(color: Colors.white38)))
+                ? const Center(
+                    child: Text('No scrape results',
+                        style: TextStyle(color: Colors.white38)))
                 : _panel(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text('${_scrapeResults.length} results', style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                        Text('${_scrapeResults.length} results',
+                            style: const TextStyle(
+                                color: Colors.white54, fontSize: 12)),
                         const SizedBox(height: 8),
                         Expanded(
                           child: SingleChildScrollView(
                             child: SingleChildScrollView(
                               scrollDirection: Axis.horizontal,
                               child: DataTable(
-                                headingRowColor: WidgetStateProperty.all(const Color(0xFF0B1220)),
+                                headingRowColor: WidgetStateProperty.all(
+                                    const Color(0xFF0B1220)),
                                 dataRowMinHeight: 36,
                                 dataRowMaxHeight: 56,
                                 columns: const [
@@ -1207,19 +1676,23 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
                                 ],
                                 rows: _scrapeResults.map((r) {
                                   return DataRow(cells: [
-                                    DataCell(_badge(r.type, _typeColor(r.type))),
+                                    DataCell(
+                                        _badge(r.type, _typeColor(r.type))),
                                     DataCell(SizedBox(
                                       width: 420,
                                       child: SelectableText(r.value,
                                           maxLines: 2,
-                                          style: const TextStyle(fontSize: 12)),
+                                          style:
+                                              const TextStyle(fontSize: 12)),
                                     )),
                                     DataCell(SizedBox(
                                       width: 260,
                                       child: Text(r.source,
                                           maxLines: 1,
                                           overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                                          style: const TextStyle(
+                                              fontSize: 11,
+                                              color: Colors.white54)),
                                     )),
                                   ]);
                                 }).toList(),
@@ -1263,26 +1736,36 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
               runSpacing: 10,
               crossAxisAlignment: WrapCrossAlignment.center,
               children: [
-                _btnPrimary('Add Scheduled Job', _addScheduledJob, color: const Color(0xFF06B6D4)),
+                _btnPrimary('Add Scheduled Job', _addScheduledJob,
+                    color: const Color(0xFF06B6D4)),
                 SizedBox(
                   width: 420,
-                  child: TextField(
-                    controller: _seriesUrlController,
-                    decoration: const InputDecoration(
-                      labelText: 'Series Watchlist URL (for Series Watchlist Check jobs)',
-                      hintText: 'Used by scheduler when running Series Watchlist Check',
+                  child: FocusGlow(
+                    child: TextField(
+                      controller: _seriesUrlController,
+                      decoration: const InputDecoration(
+                        labelText:
+                            'Series Watchlist URL (for Series Watchlist Check jobs)',
+                        hintText:
+                            'Used by scheduler when running Series Watchlist Check',
+                      ),
+                      onChanged: (v) => _seriesWatchUrl = v.trim(),
                     ),
-                    onChanged: (v) => _seriesWatchUrl = v.trim(),
                   ),
                 ),
-                Text('Scheduler checks every 30s', style: TextStyle(color: Colors.white.withValues(alpha: 0.5), fontSize: 12)),
+                Text('Scheduler checks every 30s',
+                    style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.5),
+                        fontSize: 12)),
               ],
             ),
           ),
           const SizedBox(height: 12),
           Expanded(
             child: _jobs.isEmpty
-                ? const Center(child: Text('No scheduled jobs', style: TextStyle(color: Colors.white38)))
+                ? const Center(
+                    child: Text('No scheduled jobs',
+                        style: TextStyle(color: Colors.white38)))
                 : ListView.builder(
                     itemCount: _jobs.length,
                     itemBuilder: (context, i) => _jobTile(_jobs[i]),
@@ -1316,16 +1799,20 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
         side: const BorderSide(color: Color(0xFF1F2937)),
       ),
       child: ListTile(
-        title: Text(job.type.label, style: const TextStyle(fontWeight: FontWeight.w600)),
+        title: Text(job.type.label,
+            style: const TextStyle(fontWeight: FontWeight.w600)),
         subtitle: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const SizedBox(height: 4),
-            Text('Next: ${_fmtDt(job.nextRun)}   •   Repeat: ${job.interval.label}   •   Runs: ${job.runCount}',
-                style: const TextStyle(fontSize: 12, color: Colors.white60)),
+            Text(
+                'Next: ${_fmtDt(job.nextRun)}   •   Repeat: ${job.interval.label}   •   Runs: ${job.runCount}',
+                style:
+                    const TextStyle(fontSize: 12, color: Colors.white60)),
             if (job.lastRun != null)
               Text('Last: ${_fmtDt(job.lastRun!)}',
-                  style: const TextStyle(fontSize: 11, color: Colors.white38)),
+                  style: const TextStyle(
+                      fontSize: 11, color: Colors.white38)),
           ],
         ),
         trailing: Row(
@@ -1333,9 +1820,10 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
           children: [
             _badge(job.status, statusColor),
             const SizedBox(width: 8),
-            IconButton(
+            _iconBtn(
               tooltip: 'Remove',
-              icon: const Icon(Icons.delete_outline, color: Color(0xFFEF4444)),
+              icon: Icons.delete_outline,
+              color: const Color(0xFFEF4444),
               onPressed: () => setState(() => _jobs.remove(job)),
             ),
           ],
@@ -1371,56 +1859,168 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
         borderRadius: BorderRadius.circular(6),
         border: Border.all(color: color.withValues(alpha: 0.7)),
       ),
-      child: Text(text, style: TextStyle(fontSize: 11, color: color, fontWeight: FontWeight.w600)),
+      child: Text(text,
+          style: TextStyle(
+              fontSize: 11, color: color, fontWeight: FontWeight.w600)),
     );
   }
 
-  Widget _btnPrimary(String label, VoidCallback? onPressed, {required Color color}) {
-    return ElevatedButton(
-      style: ElevatedButton.styleFrom(
-        backgroundColor: color,
-        foregroundColor: Colors.black,
-        disabledBackgroundColor: color.withValues(alpha: 0.3),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+  Widget _clickBox({required Widget child}) =>
+      ClickableRegion(child: child);
+
+  Widget _iconBtn({
+    required String tooltip,
+    required IconData icon,
+    required Color color,
+    required VoidCallback onPressed,
+  }) {
+    return ClickableRegion(
+      child: IconButton(
+        tooltip: tooltip,
+        icon: Icon(icon, color: color),
+        onPressed: onPressed,
+        splashRadius: 18,
+        hoverColor: color.withValues(alpha: 0.12),
       ),
-      onPressed: onPressed,
-      child: Text(label, style: const TextStyle(fontWeight: FontWeight.bold)),
+    );
+  }
+
+  Widget _btnPrimary(String label, VoidCallback? onPressed,
+      {required Color color}) {
+    final enabled = onPressed != null;
+    return ClickableRegion(
+      enabled: enabled,
+      child: _HoverButton(
+        onPressed: onPressed,
+        baseColor: enabled ? color : color.withValues(alpha: 0.3),
+        hoverColor: Color.lerp(color, Colors.white, 0.12) ?? color,
+        borderColor: color.withValues(alpha: 0.9),
+        hoverBorderColor: Colors.white70,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          child: Text(label,
+              style: const TextStyle(
+                  fontWeight: FontWeight.bold, color: Colors.black)),
+        ),
+      ),
     );
   }
 
   Widget _btnOutline(String label, VoidCallback? onPressed) {
-    return OutlinedButton(
-      style: OutlinedButton.styleFrom(
-        foregroundColor: const Color(0xFF22D3EE),
-        side: const BorderSide(color: Color(0xFF1F2937)),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+    final enabled = onPressed != null;
+    return ClickableRegion(
+      enabled: enabled,
+      child: _HoverButton(
+        onPressed: onPressed,
+        baseColor: Colors.transparent,
+        hoverColor: const Color(0xFF0B2230),
+        borderColor: const Color(0xFF1F2937),
+        hoverBorderColor: const Color(0xFF22D3EE),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          child: Text(label,
+              style: TextStyle(
+                  color: enabled
+                      ? const Color(0xFF22D3EE)
+                      : const Color(0xFF22D3EE).withValues(alpha: 0.4))),
+        ),
       ),
-      onPressed: onPressed,
-      child: Text(label),
     );
   }
 
   Widget _btnDanger(String label, VoidCallback? onPressed) {
-    return OutlinedButton(
-      style: OutlinedButton.styleFrom(
-        foregroundColor: const Color(0xFFEF4444),
-        side: const BorderSide(color: Color(0xFFEF4444)),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+    final enabled = onPressed != null;
+    return ClickableRegion(
+      enabled: enabled,
+      child: _HoverButton(
+        onPressed: onPressed,
+        baseColor: Colors.transparent,
+        hoverColor: const Color(0xFF2A1010),
+        borderColor: const Color(0xFFEF4444),
+        hoverBorderColor: const Color(0xFFFCA5A5),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          child: Text(label,
+              style: TextStyle(
+                  color: enabled
+                      ? const Color(0xFFEF4444)
+                      : const Color(0xFFEF4444).withValues(alpha: 0.4))),
+        ),
       ),
-      onPressed: onPressed,
-      child: Text(label),
     );
   }
 
   Widget _checkLabel(String label, bool value, ValueChanged<bool> onChanged) {
-    return InkWell(
-      onTap: () => onChanged(!value),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Checkbox(value: value, onChanged: (v) => onChanged(v ?? false)),
-          Text(label),
-        ],
+    return ClickableRegion(
+      child: InkWell(
+        onTap: () => onChanged(!value),
+        borderRadius: BorderRadius.circular(6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Checkbox(value: value, onChanged: (v) => onChanged(v ?? false)),
+            Text(label),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _HoverButton extends StatefulWidget {
+  const _HoverButton({
+    required this.child,
+    required this.onPressed,
+    required this.baseColor,
+    required this.hoverColor,
+    required this.borderColor,
+    required this.hoverBorderColor,
+  });
+
+  final Widget child;
+  final VoidCallback? onPressed;
+  final Color baseColor;
+  final Color hoverColor;
+  final Color borderColor;
+  final Color hoverBorderColor;
+
+  @override
+  State<_HoverButton> createState() => _HoverButtonState();
+}
+
+class _HoverButtonState extends State<_HoverButton> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = widget.onPressed != null;
+    final hover = _hover && enabled;
+    return MouseRegion(
+      cursor: enabled ? HandCursorProvider.cursor : SystemMouseCursors.basic,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: GestureDetector(
+        onTap: widget.onPressed,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          curve: Curves.easeOut,
+          decoration: BoxDecoration(
+            color: hover ? widget.hoverColor : widget.baseColor,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+                color: hover ? widget.hoverBorderColor : widget.borderColor),
+            boxShadow: hover
+                ? [
+                    BoxShadow(
+                      color: widget.hoverBorderColor.withValues(alpha: 0.25),
+                      blurRadius: 10,
+                      spreadRadius: 0,
+                    )
+                  ]
+                : null,
+          ),
+          child: widget.child,
+        ),
       ),
     );
   }
