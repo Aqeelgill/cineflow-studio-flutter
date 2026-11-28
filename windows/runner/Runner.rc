@@ -89,13 +89,13 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
-            VALUE "CompanyName", "com.example" "\0"
-            VALUE "FileDescription", "cineflow_flutter" "\0"
+            VALUE "CompanyName", "Aqeel Gill - CineFlow Studio" "\0"
+            VALUE "FileDescription", "CineFlow Studio Universal Downloader" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "cineflow_flutter" "\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 com.example. All rights reserved." "\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Aqeel Gill. Contact: +92 3202080379" "\0"
             VALUE "OriginalFilename", "cineflow_flutter.exe" "\0"
-            VALUE "ProductName", "cineflow_flutter" "\0"
+            VALUE "ProductName", "CineFlow Studio" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

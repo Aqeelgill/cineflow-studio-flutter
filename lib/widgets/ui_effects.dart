@@ -132,7 +132,7 @@ class GradientTitle extends StatelessWidget {
           const SizedBox(width: 8),
           ClickableRegion(
             child: Image.asset(
-              'assets/logo/cineflow_logo_4color.png',
+              'assets/logo/cineflow_icon.png',
               width: 24,
               height: 24,
               fit: BoxFit.contain,

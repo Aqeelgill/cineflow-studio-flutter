@@ -35,6 +35,8 @@ class TelegramBotService extends ChangeNotifier {
   Future<String> Function()? onPause;
   Future<String> Function()? onResume;
   Future<String> Function()? onHelp;
+  Future<String> Function(String url)? onScan;
+  Future<String> Function(String selection)? onGet;
 
   BotConnectionState get state => _state;
   String get lastError => _lastError;
@@ -180,6 +182,16 @@ class TelegramBotService extends ChangeNotifier {
       if (url.isEmpty) return 'Usage: /download <URL>';
       return await (onDownload?.call(url) ?? Future.value(t('bot_not_connected')));
     }
+    if (lower.startsWith('/scan')) {
+      final url = text.substring('/scan'.length).trim();
+      if (url.isEmpty) return 'Usage: /scan <URL>';
+      return await (onScan?.call(url) ?? Future.value('Scan not available'));
+    }
+    if (lower.startsWith('/get')) {
+      final sel = text.substring('/get'.length).trim();
+      if (sel.isEmpty) return 'Usage: /get 1,3 or /get all';
+      return await (onGet?.call(sel) ?? Future.value('No scan results available'));
+    }
     return _defaultHelp();
   }
 
@@ -188,6 +200,9 @@ class TelegramBotService extends ChangeNotifier {
 /pause
 /resume
 /download <URL>
+/scan <URL>
+/get 1,3
+/get all
 /help''';
 
   Future<void> _sendToChat(String chatId, String text) async {

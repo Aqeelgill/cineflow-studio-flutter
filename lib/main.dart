@@ -5,14 +5,16 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:html/parser.dart' as html_parser;
 import 'package:http/http.dart' as http;
 
 import 'core/app_categories.dart';
 import 'core/app_i18n.dart';
 import 'core/download_paths.dart';
 import 'core/ram_guard.dart';
+import 'core/lead_models.dart';
+import 'core/media_scan_models.dart';
 import 'engine/download_engine.dart';
+import 'services/file_filter_bridge.dart';
 import 'services/ram_guard_service.dart';
 import 'services/telegram_bot_service.dart';
 import 'widgets/telegram_bot_panel.dart';
@@ -109,11 +111,16 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
   // Scraper tab
   bool _scraping = false;
   String? _scrapeError;
-  bool _scrapeEmails = true;
-  bool _scrapePhones = true;
-  bool _scrapeSocial = true;
-  bool _scrapeMedia = true;
-  final List<ScrapeResult> _scrapeResults = [];
+  final List<LeadEntry> _leadResults = [];
+  final LeadFilterState _leadFilter = LeadFilterState();
+  int _leadPreviewLimit = 200;
+  bool _pickerOpen = false;
+
+  // Downloader scan preview
+  final List<ScannedMediaItem> _scanResults = [];
+  MediaFilter _mediaFilter = MediaFilter.all;
+  bool _scanning = false;
+  int _scanPreviewLimit = 200;
 
   // Scheduler tab
   final List<ScheduledJob> _jobs = [];
@@ -160,6 +167,8 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
     _telegram.onPause = _botPause;
     _telegram.onResume = _botResume;
     _telegram.onHelp = () async => _botHelp();
+    _telegram.onScan = _botScanUrl;
+    _telegram.onGet = _botGetScan;
     _telegram.addListener(_onTelegramChanged);
     _telegram.loadEnv();
   }
@@ -259,87 +268,89 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
     });
   }
 
+  List<ScannedMediaItem> get _filteredScanResults => _scanResults.where((i) => i.matches(_mediaFilter)).toList();
+
   Future<void> _scanPage() async {
     final url = _urlController.text.trim();
-    if (!url.startsWith('http')) {
-      _showSnack('Paste a webpage URL to scan');
-      return;
-    }
-    _showSnack('Scanning webpage...');
+    if (!url.startsWith('http')) { _showSnack('Paste a webpage URL to scan'); return; }
+    if (_scanning || _pickerOpen) return;
+    setState(() { _scanning = true; _scanPreviewLimit = 200; });
+    _showSnack('Scanning media links...');
     try {
-      final links = await _engine.scanWebpage(url);
-      setState(() {
-        for (final l in links) {
-          _queue.add(DownloadItem(
-            id: _newId(l),
-            url: l,
-            title: Uri.tryParse(l)
-                    ?.pathSegments
-                    .lastWhere((s) => s.isNotEmpty, orElse: () => l) ??
-                l,
-            platform: _engine.isDirectFile(l) ? 'Direct File' : 'Scanned',
-            quality: _addQuality,
-            category: _selectedCategory,
-          ));
-        }
-      });
-      _showSnack('${links.length} links found');
+      final items = await FileFilterBridge.scanMedia(url: url);
+      if (!mounted) return;
+      setState(() { _scanResults..clear()..addAll(items); _scanning = false; });
+      _showSnack('${items.length} media links found');
     } catch (e) {
+      if (!mounted) return;
+      setState(() => _scanning = false);
       _showSnack('Scan error: $e');
     }
   }
 
   Future<void> _attachFile() async {
+    if (_pickerOpen || _scanning) { _showSnack('File operation already in progress'); return; }
+    setState(() => _pickerOpen = true);
     try {
-      final files = await FilePicker.pickFiles();
+      final files = await FilePicker.pickFiles(
+        allowedExtensions: ['json', 'txt', 'csv', 'html', 'htm', 'xml'],
+        type: FileType.custom,
+      );
+      if (!mounted) return;
       if (files.isEmpty) return;
       final path = files.single.path;
-      if (path == null) {
-        _showSnack('Could not read selected file path');
-        return;
-      }
-      final links = await _engine.parseFileLinks(path);
-      setState(() {
-        for (final l in links) {
-          _queue.add(DownloadItem(
-            id: _newId(l),
-            url: l,
-            title: Uri.tryParse(l)
-                    ?.pathSegments
-                    .lastWhere((s) => s.isNotEmpty, orElse: () => l) ??
-                l,
-            platform: _engine.isDirectFile(l) ? 'Direct File' : 'Parsed Link',
-            quality: _addQuality,
-            category: _selectedCategory,
-          ));
-        }
-      });
-      _showSnack('${links.length} links extracted');
+      if (path == null) { _showSnack('Could not read selected file path'); return; }
+      setState(() { _scanning = true; _scanPreviewLimit = 200; });
+      final items = await FileFilterBridge.scanMedia(filePath: path);
+      if (!mounted) return;
+      setState(() { _scanResults..clear()..addAll(items); _scanning = false; });
+      _showSnack('${items.length} media links extracted');
     } catch (e) {
+      if (!mounted) return;
+      setState(() => _scanning = false);
       _showSnack('Attach/parse error: $e');
+    } finally {
+      if (mounted) setState(() => _pickerOpen = false); else _pickerOpen = false;
     }
   }
 
   Future<void> _browseFolder() async {
+    if (_pickerOpen) return;
+    setState(() => _pickerOpen = true);
     try {
       final uri = await FilePicker.pickDirectory();
-      if (uri == null) return;
+      if (uri == null || !mounted) return;
       String dir;
       if (uri.scheme == 'file' || uri.scheme.isEmpty) {
-        try {
-          dir = uri.toFilePath();
-        } catch (_) {
-          dir = uri.path;
-        }
-      } else {
-        dir = uri.toString();
-      }
-      if (dir.isNotEmpty) {
-        setState(() => _saveDir = dir);
-      }
-    } catch (e) {
-      _showSnack('Folder picker error: $e');
+        try { dir = uri.toFilePath(); } catch (_) { dir = uri.path; }
+      } else { dir = uri.toString(); }
+      if (dir.isNotEmpty) setState(() => _saveDir = dir);
+    } catch (e) { _showSnack('Folder picker error: $e'); }
+    finally { if (mounted) setState(() => _pickerOpen = false); else _pickerOpen = false; }
+  }
+
+  void _downloadSelectedScanResults() {
+    final selected = _filteredScanResults.where((i) => i.selected).toList();
+    if (selected.isEmpty) {
+      _showSnack('No scanned items selected');
+      return;
     }
+    setState(() {
+      for (final s in selected) {
+        final exists = _queue.any((q) => q.url == s.url);
+        if (exists) continue;
+        _queue.add(DownloadItem(
+          id: _newId(s.url),
+          url: s.url,
+          title: s.title.isNotEmpty ? s.title : (Uri.tryParse(s.url)?.pathSegments.lastWhere((p) => p.isNotEmpty, orElse: () => s.url) ?? s.url),
+          platform: _engine.isDirectFile(s.url) ? 'Direct File' : 'Scanned Media',
+          quality: _addQuality,
+          category: _selectedCategory,
+          selected: true,
+        ));
+      }
+    });
+    _downloadSelected();
   }
 
   void _downloadSelected() {
@@ -511,212 +522,104 @@ class _StudioHomeScreenState extends State<StudioHomeScreen> {
   }
 
   // ---------- Tab 3: Lead Scraper ----------
+  bool _looksLikeMedia(String u){
+    final low=u.toLowerCase();
+    return RegExp(r'\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m3u8|mpd|mp3|m4a|aac|flac|wav|ogg)(\?|$)').hasMatch(low);
+  }
+
   Future<void> _runScrape() async {
     final raw = _scrapeUrlController.text.trim();
-    if (raw.isEmpty) {
-      _showSnack('Enter target website URL(s)');
-      return;
-    }
+    if (raw.isEmpty) { _showSnack('Enter target website URL(s)'); return; }
     final urlReg = RegExp(r'https?://[^\s<>"\x27]+', caseSensitive: false);
-    final urls =
-        urlReg.allMatches(raw).map((m) => m.group(0)!).toSet().toList();
-    if (urls.isEmpty) {
-      _showSnack('No valid URLs found');
-      return;
-    }
-    setState(() {
-      _scraping = true;
-      _scrapeError = null;
-      _scrapeResults.clear();
-    });
+    final urls = urlReg.allMatches(raw).map((m) => m.group(0)!).toSet().toList();
+    if (urls.isEmpty) { _showSnack('No valid URLs found'); return; }
+    setState(() { _scraping = true; _scrapeError = null; });
     try {
-      final results = <ScrapeResult>[];
+      final results = <LeadEntry>[];
       final seen = <String>{};
       for (final u in urls) {
-        final res = await http.get(Uri.parse(u), headers: {
-          'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        });
+        final res = await http.get(Uri.parse(u), headers: {'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'});
         if (res.statusCode != 200) continue;
-        final body = res.body;
-        final doc = html_parser.parse(body);
-        final base = Uri.parse(u);
-
-        if (_scrapeEmails) {
-          final re = RegExp(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}',
-              caseSensitive: false);
-          for (final m in re.allMatches(body)) {
-            final v = m.group(0)!;
-            final key = 'email:$v';
-            if (seen.add(key)) {
-              results.add(ScrapeResult(type: 'Email', value: v, source: u));
-            }
-          }
-          for (final a in doc.querySelectorAll('a[href^="mailto:"]')) {
-            final href = a.attributes['href'] ?? '';
-            final v = href
-                .replaceFirst(RegExp(r'^mailto:', caseSensitive: false), '')
-                .split('?')
-                .first;
-            if (v.isNotEmpty && seen.add('email:$v')) {
-              results.add(ScrapeResult(type: 'Email', value: v, source: u));
-            }
-          }
-        }
-
-        if (_scrapePhones) {
-          final re = RegExp(r'(?:\+?\d[\d\s().-]{7,}\d)');
-          for (final m in re.allMatches(body)) {
-            final v = m.group(0)!.trim();
-            final digits = v.replaceAll(RegExp(r'\D'), '');
-            if (digits.length < 7) continue;
-            final key = 'phone:$digits';
-            if (seen.add(key)) {
-              results.add(ScrapeResult(type: 'Phone', value: v, source: u));
-            }
-          }
-        }
-
-        if (_scrapeSocial) {
-          for (final a in doc.querySelectorAll('a[href]')) {
-            final href = a.attributes['href'] ?? '';
-            try {
-              final abs = base.resolve(href).toString();
-              final low = abs.toLowerCase();
-              if (low.contains('facebook.com') ||
-                  low.contains('twitter.com') ||
-                  low.contains('x.com') ||
-                  low.contains('instagram.com') ||
-                  low.contains('linkedin.com') ||
-                  low.contains('youtube.com') ||
-                  low.contains('tiktok.com') ||
-                  low.contains('wa.me') ||
-                  low.contains('t.me')) {
-                final key = 'social:$abs';
-                if (seen.add(key)) {
-                  results
-                      .add(ScrapeResult(type: 'Social', value: abs, source: u));
-                }
-              }
-            } catch (_) {}
-          }
-        }
-
-        if (_scrapeMedia) {
-          for (final el in doc
-              .querySelectorAll('a[href], img[src], video[src], source[src]')) {
-            final rawLink =
-                el.attributes['href'] ?? el.attributes['src'] ?? '';
-            if (rawLink.isEmpty) continue;
-            try {
-              final abs = base.resolve(rawLink).toString();
-              final path = Uri.parse(abs).path.toLowerCase();
-              if (UniversalDownloadEngine.directExts
-                  .any((ext) => path.endsWith(ext))) {
-                final key = 'media:$abs';
-                if (seen.add(key)) {
-                  results.add(
-                      ScrapeResult(type: 'Media/Doc', value: abs, source: u));
-                }
-              }
-            } catch (_) {}
-          }
+        final leads = await FileFilterBridge.scanLeads(url: u, rawContent: res.body);
+        for (final l in leads) {
+          final key='${l.email}|${l.phone}|${l.website}|${l.social}|${l.name}'.toLowerCase();
+          if (seen.add(key)) results.add(l);
         }
       }
-      setState(() {
-        _scrapeResults.addAll(results);
-        _scraping = false;
-      });
-      _showSnack('${results.length} results found');
+      if (!mounted) return;
+      setState(() { _leadResults..clear()..addAll(results); _scraping = false; });
+      _showSnack('${results.length} leads found');
     } catch (e) {
-      setState(() {
-        _scraping = false;
-        _scrapeError = e.toString();
-      });
+      if (!mounted) return;
+      setState(() { _scraping = false; _scrapeError = e.toString(); });
     }
   }
 
-  String _csvEscape(String v) {
-    if (v.contains(',') || v.contains('"') || v.contains('\n')) {
-      return '"${v.replaceAll('"', '""')}"';
+  Future<void> _importLeadsJson() async {
+    if (_pickerOpen || _scraping) { _showSnack('File operation already in progress'); return; }
+    setState(() => _pickerOpen = true);
+    try {
+      final files = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['json','txt','csv','xml','html','htm']);
+      if (!mounted) return;
+      if (files.isEmpty) return;
+      final path = files.single.path;
+      if (path == null) { _showSnack('Could not read selected file path'); return; }
+      setState(() { _scraping = true; _leadPreviewLimit = 200; });
+      final leads = await FileFilterBridge.scanLeads(filePath: path);
+      if (!mounted) return;
+      setState(() { _leadResults..clear()..addAll(leads); _scraping = false; });
+      _showSnack('${leads.length} leads imported');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _scraping = false);
+      _showSnack('Lead import error: $e');
+    } finally {
+      if (mounted) setState(() => _pickerOpen = false); else _pickerOpen = false;
     }
+  }
+
+  void _deleteSelectedLeads() { setState(() => _leadResults.removeWhere((l) => l.selected)); }
+
+  String _csvEscape(String v) {
+    if (v.contains(',') || v.contains('"') || v.contains('\n')) return '"${v.replaceAll('"', '""')}"';
     return v;
   }
 
   Future<void> _exportScrapeCsv() async {
-    if (_scrapeResults.isEmpty) {
-      _showSnack('No results to export');
-      return;
-    }
+    final rows = _filteredLeads;
+    if (rows.isEmpty) { _showSnack('No results to export'); return; }
     try {
       final buf = StringBuffer();
-      buf.writeln('type,value,source');
-      for (final r in _scrapeResults) {
-        buf.writeln(
-            '${_csvEscape(r.type)},${_csvEscape(r.value)},${_csvEscape(r.source)}');
+      buf.writeln('name,email,phone,website,social,category');
+      for (final r in rows) {
+        buf.writeln('${_csvEscape(r.name)},${_csvEscape(r.email)},${_csvEscape(r.phone)},${_csvEscape(r.website)},${_csvEscape(r.social)},${_csvEscape(r.category)}');
       }
       final bytes = utf8.encode(buf.toString());
       String? saved;
       try {
-        final uri = await FilePicker.saveFile(
-          fileName: 'leads_export.csv',
-          bytes: Uint8List.fromList(bytes),
-          mimeType: 'text/csv',
-          dialogTitle: 'Export CSV',
-        );
-        if (uri != null) {
-          if (uri.scheme == 'file' || uri.scheme.isEmpty) {
-            try {
-              saved = uri.toFilePath();
-            } catch (_) {
-              saved = uri.toString();
-            }
-          } else {
-            saved = uri.toString();
-          }
-        }
-      } catch (_) {
-        saved = null;
-      }
+        final uri = await FilePicker.saveFile(fileName: 'leads_export.csv', bytes: Uint8List.fromList(bytes), mimeType: 'text/csv', dialogTitle: 'Export CSV');
+        if (uri != null) { saved = (uri.scheme == 'file' || uri.scheme.isEmpty) ? uri.toFilePath() : uri.toString(); }
+      } catch (_) { saved = null; }
       if (saved == null || saved.isEmpty) {
-        final fallback =
-            '$_saveDir${Platform.pathSeparator}leads_export_${DateTime.now().millisecondsSinceEpoch}.csv';
-        final file = File(fallback);
-        await file.create(recursive: true);
-        await file.writeAsBytes(bytes);
-        saved = file.path;
+        final fallback = '$_saveDir${Platform.pathSeparator}leads_export_${DateTime.now().millisecondsSinceEpoch}.csv';
+        final file = File(fallback); await file.create(recursive: true); await file.writeAsBytes(bytes); saved = file.path;
       }
       _showSnack('Exported: $saved');
-    } catch (e) {
-      _showSnack('Export error: $e');
-    }
+    } catch (e) { _showSnack('Export error: $e'); }
   }
 
   void _sendScrapeMediaToDownloader() {
-    final media = _scrapeResults.where((r) => r.type == 'Media/Doc').toList();
-    if (media.isEmpty) {
-      _showSnack('No media/docs found');
-      return;
-    }
+    final media = _leadResults.where((l) => _looksLikeMedia(l.website) && l.selected).toList();
+    final source = media.isNotEmpty ? media : _leadResults.where((l) => _looksLikeMedia(l.website)).toList();
+    if (source.isEmpty) { _showSnack('No media links found'); return; }
     setState(() {
-      for (final m in media) {
-        final exists = _queue.any((q) => q.url == m.value);
-        if (exists) continue;
-        _queue.add(DownloadItem(
-          id: _newId(m.value),
-          url: m.value,
-          title: Uri.tryParse(m.value)
-                  ?.pathSegments
-                  .lastWhere((s) => s.isNotEmpty, orElse: () => m.value) ??
-              m.value,
-          platform: 'Scraped Media',
-          quality: _addQuality,
-          category: _selectedCategory,
-        ));
+      for (final m in source) {
+        if (_queue.any((q) => q.url == m.website)) continue;
+        _queue.add(DownloadItem(id: _newId(m.website), url: m.website, title: Uri.tryParse(m.website)?.pathSegments.lastWhere((s)=>s.isNotEmpty, orElse:()=>m.website) ?? m.website, platform: 'Scraped Media', quality: _addQuality, category: _selectedCategory));
       }
       _selectedTab = 0;
     });
-    _showSnack('${media.length} media links sent to Downloader');
+    _showSnack('${source.length} media links sent to Downloader');
   }
 
   // ---------- Tab 4: Scheduler ----------
@@ -906,7 +809,47 @@ Category root: $_saveDir""";
   }
 
   String _botHelp() {
-    return '${AppI18n.t('help', _locale)}:\n/status\n/pause\n/resume\n/download <URL>\n/help';
+    return '${AppI18n.t('help', _locale)}:\n/status\n/pause\n/resume\n/download <URL>\n/scan <URL>\n/get 1,3\n/get all\n/help';
+  }
+
+  Future<String> _botScanUrl(String url) async {
+    if (!url.startsWith('http')) return 'Usage: /scan <URL>';
+    final items = await FileFilterBridge.scanMedia(url: url);
+    if (!mounted) return 'Scan failed';
+    setState(() { _scanResults..clear()..addAll(items); _selectedTab = 0; });
+    if (items.isEmpty) return 'No media links found.';
+    final lines = <String>['Found ${items.length} media links:'];
+    for (var i=0; i<items.length && i<20; i++) {
+      final it=items[i];
+      final tag = it.tag.isNotEmpty ? ' [${it.tag}]' : '';
+      lines.add('${i+1}. ${it.title}$tag');
+    }
+    if (items.length>20) lines.add('...and ${items.length-20} more');
+    lines.add('Use /get 1,3 or /get all');
+    return lines.join('\n');
+  }
+
+  Future<String> _botGetScan(String selection) async {
+    if (_scanResults.isEmpty) return 'No scan results. Use /scan <URL> first.';
+    final sel = selection.trim().toLowerCase();
+    final picked = <ScannedMediaItem>[];
+    if (sel == 'all') {
+      picked.addAll(_scanResults);
+    } else {
+      final idxs = sel.split(RegExp(r'[\s,]+')).where((s)=>s.isNotEmpty).map((s)=>int.tryParse(s)).whereType<int>();
+      for (final i in idxs) { if (i>=1 && i<=_scanResults.length) picked.add(_scanResults[i-1]); }
+    }
+    if (picked.isEmpty) return 'No valid selection. Use /get 1,3 or /get all';
+    var started=0;
+    for (final s in picked) {
+      if (_queue.any((q)=>q.url==s.url)) continue;
+      final item = DownloadItem(id:_newId(s.url), url:s.url, title:s.title.isNotEmpty?s.title:s.url, platform:_engine.isDirectFile(s.url)?'Direct File':'Scanned Media', quality:_addQuality, category:_selectedCategory, selected:true);
+      setState(()=>_queue.add(item));
+      _enqueueStart(item);
+      started++;
+    }
+    _pumpQueue();
+    return 'Started $started download(s) from scan selection.';
   }
 
   void _openTelegramPanel() {
@@ -918,6 +861,32 @@ Category root: $_saveDir""";
       builder: (_) => SizedBox(
         height: MediaQuery.of(context).size.height * 0.85,
         child: TelegramBotPanel(service: _telegram),
+      ),
+    );
+  }
+
+  void _showAbout() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF111827),
+        title: Row(children: [
+          Image.asset('assets/logo/cineflow_icon.png', width: 32, height: 32),
+          const SizedBox(width: 10),
+          const Text('CineFlow Studio'),
+        ]),
+        content: const Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('CineFlow Studio Universal Downloader'),
+            SizedBox(height: 8),
+            Text('Creator: Aqeel Gill'),
+            Text('Copyright: Copyright (c) 2026 Aqeel Gill - CineFlow Studio'),
+            Text('Support Contact: +92 3202080379'),
+          ],
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
       ),
     );
   }
@@ -939,6 +908,7 @@ Category root: $_saveDir""";
           Padding(padding: const EdgeInsets.only(right: 8), child: Center(child: _languagePicker())),
           Padding(padding: const EdgeInsets.only(right: 8), child: Center(child: _ramModePicker())),
           Padding(padding: const EdgeInsets.only(right: 8), child: Center(child: _telegramButton())),
+          IconButton(tooltip: 'About', onPressed: _showAbout, icon: const Icon(Icons.info_outline, color: Color(0xFF9CA3AF))),
           Padding(padding: const EdgeInsets.only(right: 16), child: Center(child: _ramPill(decision.alert))),
         ],
       ),
@@ -995,7 +965,7 @@ Category root: $_saveDir""";
                         child: Opacity(
                           opacity: 0.08,
                           child: Image.asset(
-                            'assets/logo/cineflow_logo.png',
+                            'assets/logo/cineflow_icon.png',
                             height: constraints.maxHeight * 0.35,
                             fit: BoxFit.contain,
                           ),
@@ -1233,11 +1203,14 @@ Category root: $_saveDir""";
                       ),
                     ),
                     _btnPrimary('Paste & Add', _pasteAndAdd, color: const Color(0xFF06B6D4)),
-                    _btnOutline('Scan Page', _scanPage),
-                    _btnOutline('Attach File', _attachFile),
+                    _btnOutline(_scanning ? 'Scanning...' : 'Scan Page', (_scanning || _pickerOpen) ? null : _scanPage),
+                    _btnOutline(_pickerOpen ? 'Opening...' : 'Attach File', (_scanning || _pickerOpen) ? null : _attachFile),
+                    _filterIconButton(),
                   ],
                 ),
                 const SizedBox(height: 10),
+                if (_scanResults.isNotEmpty) _buildScanPreviewPanel(),
+                if (_scanResults.isNotEmpty) const SizedBox(height: 10),
                 Wrap(
                   spacing: 8,
                   runSpacing: 8,
@@ -1262,7 +1235,7 @@ Category root: $_saveDir""";
                             style: TextStyle(fontSize: 13)),
                       ],
                     ),
-                    _btnPrimary(AppI18n.t('download_all', _locale), _downloadSelected, color: const Color(0xFF10B981)),
+                    _btnPrimary('Download Selected', _downloadSelected, color: const Color(0xFF10B981)),
                     _btnOutline(AppI18n.t('pause', _locale), _pauseSelectedOrRunning),
                     _btnOutline(AppI18n.t('resume', _locale), _resumeSelected),
                     _btnOutline('Restart', _restartSelected),
@@ -1574,7 +1547,12 @@ Category root: $_saveDir""";
   }
 
   // ---------- Scraper UI ----------
+  List<LeadEntry> get _filteredLeads => _leadResults.where((l) => l.matches(_leadFilter)).toList();
+
   Widget _buildScraperTab() {
+    final visible = _filteredLeads;
+    final capped = visible.take(_leadPreviewLimit).toList();
+    final allSelected = visible.isNotEmpty && visible.every((l) => l.selected);
     return Padding(
       padding: const EdgeInsets.all(14),
       child: Column(
@@ -1588,140 +1566,55 @@ Category root: $_saveDir""";
                     controller: _scrapeUrlController,
                     minLines: 1,
                     maxLines: 3,
-                    decoration: const InputDecoration(
-                      hintText:
-                          'Target website URL(s) — space or newline separated...',
-                    ),
+                    decoration: const InputDecoration(hintText: 'Target website URL(s) — space or newline separated...'),
                   ),
                 ),
                 const SizedBox(height: 10),
-                Wrap(
-                  spacing: 16,
-                  runSpacing: 4,
-                  children: [
-                    _checkLabel('Emails', _scrapeEmails,
-                        (v) => setState(() => _scrapeEmails = v)),
-                    _checkLabel('Phone Numbers', _scrapePhones,
-                        (v) => setState(() => _scrapePhones = v)),
-                    _checkLabel('Social Links', _scrapeSocial,
-                        (v) => setState(() => _scrapeSocial = v)),
-                    _checkLabel('Downloadable Media/Docs', _scrapeMedia,
-                        (v) => setState(() => _scrapeMedia = v)),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    _btnPrimary('Scrape', _scraping ? null : _runScrape,
-                        color: const Color(0xFF06B6D4)),
-                    _btnOutline('Export CSV',
-                        _scrapeResults.isEmpty ? null : _exportScrapeCsv),
-                    _btnPrimary(
-                        'Send Media to Downloader',
-                        _scrapeResults.any((r) => r.type == 'Media/Doc')
-                            ? _sendScrapeMediaToDownloader
-                            : null,
-                        color: const Color(0xFF10B981)),
-                    if (_scraping) ...[
-                      const SizedBox(width: 8),
-                      const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2)),
-                      const SizedBox(width: 6),
-                      const Text('Scraping...',
-                          style: TextStyle(color: Colors.white54)),
-                    ],
-                  ],
-                ),
-                if (_scrapeError != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Text(_scrapeError!,
-                        style: const TextStyle(
-                            color: Color(0xFFEF4444), fontSize: 12)),
-                  ),
+                Wrap(spacing: 8, runSpacing: 8, children: [
+                  _btnPrimary('Scrape', _scraping ? null : _runScrape, color: const Color(0xFF06B6D4)),
+                  _btnOutline('Import Leads JSON', (_scraping || _pickerOpen) ? null : _importLeadsJson),
+                  _leadFilterIconButton(),
+                  _btnOutline('Export CSV', _leadResults.isEmpty ? null : _exportScrapeCsv),
+                  _btnDanger('Delete Selected', _leadResults.any((l)=>l.selected) ? _deleteSelectedLeads : null),
+                  _btnPrimary('Send Media to Downloader', _leadResults.any((l)=>_looksLikeMedia(l.website)) ? _sendScrapeMediaToDownloader : null, color: const Color(0xFF10B981)),
+                  if (_scraping) const Padding(padding: EdgeInsets.only(left:8), child: SizedBox(width:16,height:16,child:CircularProgressIndicator(strokeWidth:2))),
+                ]),
+                if (_scrapeError != null) Padding(padding: const EdgeInsets.only(top: 6), child: Text(_scrapeError!, style: const TextStyle(color: Color(0xFFEF4444), fontSize: 12))),
               ],
             ),
           ),
           const SizedBox(height: 12),
           Expanded(
-            child: _scrapeResults.isEmpty
-                ? const Center(
-                    child: Text('No scrape results',
-                        style: TextStyle(color: Colors.white38)))
+            child: _leadResults.isEmpty
+                ? Center(child: _scraping ? const CircularProgressIndicator() : const Text('No leads found', style: TextStyle(color: Colors.white38)))
                 : _panel(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('${_scrapeResults.length} results',
-                            style: const TextStyle(
-                                color: Colors.white54, fontSize: 12)),
-                        const SizedBox(height: 8),
-                        Expanded(
-                          child: SingleChildScrollView(
-                            child: SingleChildScrollView(
-                              scrollDirection: Axis.horizontal,
-                              child: DataTable(
-                                headingRowColor: WidgetStateProperty.all(
-                                    const Color(0xFF0B1220)),
-                                dataRowMinHeight: 36,
-                                dataRowMaxHeight: 56,
-                                columns: const [
-                                  DataColumn(label: Text('Type')),
-                                  DataColumn(label: Text('Value')),
-                                  DataColumn(label: Text('Source')),
-                                ],
-                                rows: _scrapeResults.map((r) {
-                                  return DataRow(cells: [
-                                    DataCell(
-                                        _badge(r.type, _typeColor(r.type))),
-                                    DataCell(SizedBox(
-                                      width: 420,
-                                      child: SelectableText(r.value,
-                                          maxLines: 2,
-                                          style:
-                                              const TextStyle(fontSize: 12)),
-                                    )),
-                                    DataCell(SizedBox(
-                                      width: 260,
-                                      child: Text(r.source,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(
-                                              fontSize: 11,
-                                              color: Colors.white54)),
-                                    )),
-                                  ]);
-                                }).toList(),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Row(children: [
+                        _clickBox(child: Checkbox(value: allSelected, onChanged: (v)=>setState((){for(final l in visible){l.selected=v??false;}}))),
+                        Expanded(child: Text('${visible.length} visible / ${_leadResults.length} total (showing ${capped.length})', style: const TextStyle(color: Colors.white54, fontSize: 12))),
+                        if (visible.length > capped.length) TextButton(onPressed: ()=>setState(()=>_leadPreviewLimit += 200), child: Text('Show more (${visible.length - capped.length})')),
+                      ]),
+                      const SizedBox(height: 8),
+                      Expanded(child: ListView.builder(
+                        itemCount: capped.length,
+                        itemBuilder: (c, i) {
+                          final l = capped[i];
+                          return Container(margin: const EdgeInsets.only(bottom:6), padding: const EdgeInsets.symmetric(horizontal:8, vertical:6), decoration: BoxDecoration(color: const Color(0xFF111827), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFF1F2937))), child: Row(children: [
+                            _clickBox(child: Checkbox(value: l.selected, onChanged: (v)=>setState(()=>l.selected=v??false))),
+                            SizedBox(width:120, child: Text(l.name, maxLines:1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize:12))),
+                            SizedBox(width:170, child: Text(l.email, maxLines:1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize:12))),
+                            SizedBox(width:120, child: Text(l.phone, maxLines:1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize:12))),
+                            Expanded(child: Text(l.website.isNotEmpty ? l.website : l.social, maxLines:1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize:12, color: Colors.white70))),
+                            SizedBox(width:100, child: Text(l.category, maxLines:1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize:11, color: Colors.white54))),
+                          ]));
+                        },
+                      )),
+                    ]),
                   ),
           ),
         ],
       ),
     );
-  }
-
-  Color _typeColor(String type) {
-    switch (type) {
-      case 'Email':
-        return const Color(0xFF06B6D4);
-      case 'Phone':
-        return const Color(0xFF10B981);
-      case 'Social':
-        return Colors.purpleAccent;
-      case 'Media/Doc':
-        return Colors.orangeAccent;
-      default:
-        return Colors.white54;
-    }
   }
 
   // ---------- Scheduler UI ----------
@@ -1865,6 +1758,76 @@ Category root: $_saveDir""";
     );
   }
 
+  Widget _filterIconButton() {
+    return PopupMenuButton<MediaFilter>(
+      tooltip: 'Filter media',
+      onSelected: (f) => setState(() => _mediaFilter = f),
+      itemBuilder: (_) => MediaFilter.values.map((f) => PopupMenuItem(value: f, child: Row(children: [Icon(_mediaFilter==f?Icons.radio_button_checked:Icons.radio_button_off, size:16, color: const Color(0xFF06B6D4)), const SizedBox(width:8), Flexible(child: Text(f.label))]))).toList(),
+      child: Container(padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: const Color(0xFF111827), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFF06B6D4).withValues(alpha:0.5))), child: const Icon(Icons.filter_list, color: Color(0xFF06B6D4), size: 20)),
+    );
+  }
+
+  Widget _leadFilterIconButton() {
+    return PopupMenuButton<String>(
+      tooltip: 'Filter leads',
+      itemBuilder: (_) => [
+        CheckedPopupMenuItem(value:'email', checked:_leadFilter.mustHaveEmail, child: const Text('Must have email')),
+        CheckedPopupMenuItem(value:'phone', checked:_leadFilter.mustHavePhone, child: const Text('Must have phone')),
+        CheckedPopupMenuItem(value:'website', checked:_leadFilter.hasWebsite, child: const Text('Has website')),
+        CheckedPopupMenuItem(value:'social', checked:_leadFilter.hasSocial, child: const Text('Has social links')),
+        const PopupMenuDivider(),
+        PopupMenuItem(value:'keyword', child: Text(_leadFilter.keyword.isEmpty ? 'Set keyword filter...' : 'Keyword: ${_leadFilter.keyword}')),
+        PopupMenuItem(value:'clear', child: const Text('Clear filters')),
+      ],
+      onSelected: (v) async {
+        if (v=='email') setState(()=>_leadFilter.mustHaveEmail=!_leadFilter.mustHaveEmail);
+        if (v=='phone') setState(()=>_leadFilter.mustHavePhone=!_leadFilter.mustHavePhone);
+        if (v=='website') setState(()=>_leadFilter.hasWebsite=!_leadFilter.hasWebsite);
+        if (v=='social') setState(()=>_leadFilter.hasSocial=!_leadFilter.hasSocial);
+        if (v=='clear') setState((){_leadFilter.mustHaveEmail=false;_leadFilter.mustHavePhone=false;_leadFilter.hasWebsite=false;_leadFilter.hasSocial=false;_leadFilter.keyword='';});
+        if (v=='keyword') {
+          final c = TextEditingController(text:_leadFilter.keyword);
+          final kw = await showDialog<String>(context: context, builder: (ctx)=>AlertDialog(title: const Text('Keyword filter'), content: TextField(controller:c, decoration: const InputDecoration(hintText:'email domain, name, niche...')), actions:[TextButton(onPressed:()=>Navigator.pop(ctx), child: const Text('Cancel')), TextButton(onPressed:()=>Navigator.pop(ctx,c.text.trim()), child: const Text('Apply'))]));
+          if (kw!=null) setState(()=>_leadFilter.keyword=kw);
+        }
+      },
+      child: Container(padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: const Color(0xFF111827), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFF06B6D4).withValues(alpha:0.5))), child: const Icon(Icons.filter_alt, color: Color(0xFF06B6D4), size: 20)),
+    );
+  }
+
+  Widget _buildScanPreviewPanel() {
+    final visible = _filteredScanResults;
+    final capped = visible.take(_scanPreviewLimit).toList();
+    final allSelected = visible.isNotEmpty && visible.every((i)=>i.selected);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(color: const Color(0xFF0B1220), borderRadius: BorderRadius.circular(10), border: Border.all(color: const Color(0xFF1F2937))),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.playlist_add_check, color: Color(0xFF06B6D4), size: 18),
+          const SizedBox(width: 8),
+          Expanded(child: Text('Scanned Media (${visible.length}/${_scanResults.length})', style: const TextStyle(fontWeight: FontWeight.w600))),
+          _clickBox(child: Checkbox(value: allSelected, onChanged: (v)=>setState((){for(final i in visible){i.selected=v??false;}}))),
+          const Text('Select all filtered', style: TextStyle(fontSize: 12, color: Colors.white70)),
+          const SizedBox(width: 8),
+          _btnPrimary('Download Selected', visible.any((i)=>i.selected) ? _downloadSelectedScanResults : null, color: const Color(0xFF10B981)),
+        ]),
+        const SizedBox(height: 8),
+        SizedBox(height: 220, child: ListView.builder(
+          itemCount: capped.length + (visible.length > capped.length ? 1 : 0),
+          itemBuilder: (c,i){
+            if (i >= capped.length) {
+              return Center(child: TextButton(onPressed: ()=>setState(()=>_scanPreviewLimit += 200), child: Text('Show more (${visible.length - capped.length} remaining)')));
+            }
+            final m=capped[i];
+            return Container(margin: const EdgeInsets.only(bottom:6), padding: const EdgeInsets.symmetric(horizontal:8, vertical:6), decoration: BoxDecoration(color: const Color(0xFF111827), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFF1F2937))), child: Row(children:[_clickBox(child: Checkbox(value:m.selected, onChanged:(v)=>setState(()=>m.selected=v??false))), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children:[Text(m.title, maxLines:1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize:12, fontWeight: FontWeight.w500)), Text(m.url, maxLines:1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize:10, color: Colors.white38))])), const SizedBox(width:8), _badge(m.format, const Color(0xFF06B6D4)), if(m.tag.isNotEmpty) ...[const SizedBox(width:6), _badge(m.tag, const Color(0xFFF59E0B))]]));
+          },
+        )),
+      ]),
+    );
+  }
+
   Widget _clickBox({required Widget child}) =>
       ClickableRegion(child: child);
 
@@ -1950,21 +1913,6 @@ Category root: $_saveDir""";
     );
   }
 
-  Widget _checkLabel(String label, bool value, ValueChanged<bool> onChanged) {
-    return ClickableRegion(
-      child: InkWell(
-        onTap: () => onChanged(!value),
-        borderRadius: BorderRadius.circular(6),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Checkbox(value: value, onChanged: (v) => onChanged(v ?? false)),
-            Text(label),
-          ],
-        ),
-      ),
-    );
-  }
 }
 
 class _HoverButton extends StatefulWidget {
@@ -2027,12 +1975,6 @@ class _HoverButtonState extends State<_HoverButton> {
 }
 
 // ---------- Models ----------
-class ScrapeResult {
-  final String type;
-  final String value;
-  final String source;
-  ScrapeResult({required this.type, required this.value, required this.source});
-}
 
 enum JobType { downloadAll, seriesWatch, leadScraper }
 

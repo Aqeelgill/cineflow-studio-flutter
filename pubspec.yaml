@@ -67,6 +67,7 @@ flutter:
   assets:
     - assets/logo/cineflow_logo.png
     - assets/logo/cineflow_logo_4color.png
+    - assets/logo/cineflow_icon.png
     - assets/cursors/hand_black.png
 
   # An image asset can refer to one or more resolution-specific "variants", see
